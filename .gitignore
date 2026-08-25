@@ -1,0 +1,18 @@
+Citadelle_gateway
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Éditeurs / OS
+.idea/
+.vscode/
+.DS_Store
+*.swp
+*.swo
+
+# Logs et fichiers temporaires
+*.log
+*.tmp
+*.bak

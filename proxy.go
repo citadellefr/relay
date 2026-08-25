@@ -1,0 +1,188 @@
+package main
+
+import (
+	"context"
+	"encoding/binary"
+	"log"
+	"net"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/hashicorp/yamux"
+	"golang.org/x/time/rate"
+)
+
+// runProxy accepts raw TLS connections from clients, routes each one to the
+// tenant tunnel matching its SNI and copies bytes both ways. The tenant store
+// is only read to decide what deserves a log line;
+// routing itself is the registry's business.
+func runProxy(ln net.Listener, baseDomain string, reg *registry, tenants *tenantStore) error {
+	for {
+		conn, err := ln.Accept()
+		if err != nil {
+			return err
+		}
+		go handleClient(conn, baseDomain, reg, tenants)
+	}
+}
+
+var (
+	noTunnelMu   sync.Mutex
+	noTunnelLast = make(map[string]time.Time)
+)
+
+func logNoTunnel(tenant string, addr net.Addr) {
+	noTunnelMu.Lock()
+	if time.Since(noTunnelLast[tenant]) >= 5*time.Minute {
+		noTunnelLast[tenant] = time.Now()
+		noTunnelMu.Unlock()
+		log.Printf("proxy: no tunnel for %q (%s)", tenant, logAddr(addr))
+		return
+	}
+	noTunnelMu.Unlock()
+}
+
+func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tenantStore) {
+	defer conn.Close()
+	sni, peeked, err := peekClientHello(conn, 10*time.Second)
+	if err != nil {
+		return
+	}
+	tenant, sess := resolveTenant(sni, baseDomain, reg)
+	if sess == nil {
+		if knownTenant(tenant, tenants) {
+			logNoTunnel(tenant, conn.RemoteAddr())
+		}
+		return
+	}
+	if !reg.acquireStream(tenant) {
+		log.Printf("proxy: stream cap reached for %q, dropping %s", tenant, logAddr(conn.RemoteAddr()))
+		return
+	}
+	defer reg.releaseStream(tenant)
+	stream, err := sess.Open()
+	if err != nil {
+		return
+	}
+	defer stream.Close()
+	if _, err := stream.Write(proxyHeader(conn)); err != nil {
+		return
+	}
+	if _, err := stream.Write(peeked); err != nil {
+		return
+	}
+	pipe(conn, stream, reg.bandwidth(tenant))
+}
+
+// tenantFromSNI accepts exactly one label before the base domain.
+func tenantFromSNI(sni, baseDomain string) (string, bool) {
+	tenant, found := strings.CutSuffix(strings.ToLower(sni), "."+strings.ToLower(baseDomain))
+	if !found || tenant == "" || strings.Contains(tenant, ".") {
+		return "", false
+	}
+	return tenant, true
+}
+
+const sharePrefix = "partage-"
+
+// resolveTenant maps an SNI to a live tunnel.
+func resolveTenant(sni, baseDomain string, reg *registry) (string, *yamux.Session) {
+	label, ok := tenantFromSNI(sni, baseDomain)
+	if !ok {
+		return "", nil
+	}
+	if sess := reg.lookup(label); sess != nil {
+		return label, sess
+	}
+	if tenant, found := strings.CutPrefix(label, sharePrefix); found && tenant != "" {
+		if sess := reg.lookup(tenant); sess != nil {
+			return tenant, sess
+		}
+	}
+	return label, nil
+}
+
+func knownTenant(label string, tenants *tenantStore) bool {
+	if label == "" || tenants == nil {
+		return false
+	}
+	if tenants.has(label) {
+		return true
+	}
+	base, found := strings.CutPrefix(label, sharePrefix)
+	return found && tenants.has(base)
+}
+
+var proxyV2Sig = []byte{0x0D, 0x0A, 0x0D, 0x0A, 0x00, 0x0D, 0x0A, 0x51, 0x55, 0x49, 0x54, 0x0A}
+
+func proxyHeader(c net.Conn) []byte {
+	src, sok := c.RemoteAddr().(*net.TCPAddr)
+	dst, dok := c.LocalAddr().(*net.TCPAddr)
+	hdr := make([]byte, 0, 52)
+	hdr = append(hdr, proxyV2Sig...)
+	if !sok || !dok {
+		return append(hdr, 0x20, 0x00, 0x00, 0x00)
+	}
+	srcIP, dstIP := src.IP.To4(), dst.IP.To4()
+	fam := byte(0x11)
+	if srcIP == nil || dstIP == nil {
+		srcIP, dstIP = src.IP.To16(), dst.IP.To16()
+		fam = 0x21
+	}
+	if srcIP == nil || dstIP == nil {
+		return append(hdr, 0x20, 0x00, 0x00, 0x00)
+	}
+	hdr = append(hdr, 0x21, fam)
+	hdr = binary.BigEndian.AppendUint16(hdr, uint16(2*len(srcIP)+4))
+	hdr = append(hdr, srcIP...)
+	hdr = append(hdr, dstIP...)
+	hdr = binary.BigEndian.AppendUint16(hdr, uint16(src.Port))
+	return binary.BigEndian.AppendUint16(hdr, uint16(dst.Port))
+}
+
+const pipeIdleTimeout = 5 * time.Minute
+
+var copyBufPool = sync.Pool{
+	New: func() any {
+		b := make([]byte, 32*1024)
+		return &b
+	},
+}
+
+func pipe(a, b net.Conn, lim *rate.Limiter) {
+	done := make(chan struct{}, 2)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	cp := func(dst, src net.Conn) {
+		bufPtr := copyBufPool.Get().(*[]byte)
+		buf := *bufPtr
+		defer copyBufPool.Put(bufPtr)
+		for {
+			src.SetReadDeadline(time.Now().Add(pipeIdleTimeout))
+			n, err := src.Read(buf)
+			if n > 0 {
+				if lim != nil {
+					if werr := lim.WaitN(ctx, n); werr != nil {
+						break
+					}
+				}
+				dst.SetWriteDeadline(time.Now().Add(pipeIdleTimeout))
+				if _, werr := dst.Write(buf[:n]); werr != nil {
+					break
+				}
+			}
+			if err != nil {
+				break
+			}
+		}
+		cancel()
+		done <- struct{}{}
+	}
+	go cp(a, b)
+	go cp(b, a)
+	<-done
+	a.Close()
+	b.Close()
+	<-done
+}
