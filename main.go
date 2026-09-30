@@ -21,7 +21,11 @@ import (
 	"time"
 )
 
+// version is the release this binary was built from, stamped by the Dockerfile.
+var version = "dev"
+
 func main() {
+	log.Printf("gateway %s", version)
 	domain := mustEnv("DOMAIN")
 	certFile := mustEnv("TLS_CERT")
 	keyFile := mustEnv("TLS_KEY")
@@ -46,7 +50,7 @@ func main() {
 	}
 
 	reg := newRegistry(limits{
-		MaxStreams:  envInt("TENANT_MAX_STREAMS", 256),
+		MaxStreams:  envInt("TENANT_MAX_STREAMS", 128),
 		MaxBytesSec: envInt("TENANT_MAX_MBPS", 0) * 1_000_000 / 8,
 	})
 	tenants.reloadOnSIGHUP(reg, log.Printf)

@@ -14,8 +14,9 @@ func runHealth(addr string, reg *registry) error {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(struct {
 			Status  string                 `json:"status"`
+			Version string                 `json:"version"`
 			Tenants map[string]tenantStats `json:"tenants"`
-		}{"ok", reg.snapshot()})
+		}{"ok", version, reg.snapshot()})
 	})
 	srv := &http.Server{
 		Addr:              addr,

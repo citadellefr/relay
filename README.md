@@ -50,7 +50,7 @@ Configuration is provided through environment variables:
 | `HEALTH_ADDR` | Listen address for local health metrics (`""` to disable). | `127.0.0.1:7001` |
 | `CONTROL_CLIENT_CA`| Path to CA certificate pool for mTLS client verification. | `""` |
 | `CONTROL_MTLS` | mTLS enforcement mode: `off`, `transition`, or `require`. | `""` |
-| `TENANT_MAX_STREAMS`| Max concurrent proxied streams per tenant (`0` for unlimited). | `256` |
+| `TENANT_MAX_STREAMS`| Max concurrent proxied streams per tenant (`0` for unlimited). Worst-case memory is streams × the 2 MiB yamux window. | `128` |
 | `TENANT_MAX_MBPS` | Shared bandwidth limit per tenant in Mbps (`0` for unlimited). | `0` |
 | `LOG_CLIENT_IP` | Client IP logging policy: `masked` (/24 or /48) or `full`. | `masked` |
 

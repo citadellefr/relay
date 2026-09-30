@@ -177,6 +177,10 @@ func yamuxConfig() *yamux.Config {
 	cfg.ConnectionWriteTimeout = 15 * time.Second
 	// don't let Open block on a frozen tunnel the keepalive hasn't caught yet
 	cfg.StreamOpenTimeout = 15 * time.Second
+	// the receiver's window bounds the sender: 256 KiB held downloads to about
+	// 5 MB/s at 50 ms. Worst case in memory is streams × window per tenant,
+	// which TENANT_MAX_STREAMS bounds.
+	cfg.MaxStreamWindowSize = 2 * 1024 * 1024
 	return cfg
 }
 
