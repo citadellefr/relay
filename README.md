@@ -52,6 +52,8 @@ Configuration is provided through environment variables:
 | `CONTROL_MTLS` | mTLS enforcement mode: `off`, `transition`, or `require`. | `""` |
 | `TENANT_MAX_STREAMS`| Max concurrent proxied streams per tenant (`0` for unlimited). Worst-case memory is streams × the 2 MiB yamux window. | `128` |
 | `TENANT_MAX_MBPS` | Shared bandwidth limit per tenant in Mbps (`0` for unlimited). | `0` |
+| `TURN_HOST` | The one name on the proxy port that is not a tenant's: a TURN relay reached over TLS, routed verbatim to `TURN_TLS_ADDR`. Empty routes nothing. | — |
+| `TURN_TLS_ADDR` | `host:port` where that relay terminates its own TLS. Set together with `TURN_HOST`. | — |
 | `LOG_CLIENT_IP` | Client IP logging policy: `masked` (/24 or /48) or `full`. | `masked` |
 
 ### `tenants.json`

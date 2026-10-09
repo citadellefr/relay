@@ -76,7 +76,7 @@ func TestProxyJournalHasNoClientAddress(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer ln.Close()
-	go runProxy(ln, domain, newRegistry(limits{}), tenants)
+	go runProxy(ln, domain, newRegistry(limits{}), tenants, turnRelay{})
 
 	// no tunnel is registered: both handshakes fail, only the second one is
 	// about a tenant we know, and the client sees the drop after the log

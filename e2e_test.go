@@ -63,7 +63,7 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer proxyLn.Close()
-	go runProxy(proxyLn, domain, reg, tenants)
+	go runProxy(proxyLn, domain, reg, tenants, turnRelay{})
 
 	tenantCert := testCert(t, "tenant1.gw.test")
 	proxyHdr := make(chan string, 1)
@@ -704,5 +704,56 @@ func TestPipeWriteDeadline(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("pipe did not terminate cleanly on close")
+	}
+}
+
+// The visio relay's name is routed to the relay, bytes verbatim: the relay
+// terminates its own TLS, and a tenant of the same label never sees it.
+func TestTurnRelayRoutedBySNI(t *testing.T) {
+	const domain = "gw.test"
+	relayLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{testCert(t, "turn.gw.test")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer relayLn.Close()
+	go func() {
+		for {
+			conn, err := relayLn.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				io.Copy(conn, conn)
+			}()
+		}
+	}()
+
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyLn.Close()
+	turn := turnRelay{host: "turn.gw.test", addr: relayLn.Addr().String()}
+	go runProxy(proxyLn, domain, newRegistry(limits{}), testTenantStore(t, map[string]string{"turn": "sekrit"}), turn)
+
+	conn, err := tls.Dial("tcp", proxyLn.Addr().String(),
+		&tls.Config{ServerName: "TURN.gw.test", InsecureSkipVerify: true})
+	if err != nil {
+		t.Fatalf("handshake with the relay through the proxy: %v", err)
+	}
+	defer conn.Close()
+	if got := conn.ConnectionState().PeerCertificates[0].Subject.CommonName; got != "turn.gw.test" {
+		t.Fatalf("TLS terminated by %q, want the relay itself", got)
+	}
+	conn.SetDeadline(time.Now().Add(5 * time.Second))
+	if _, err := conn.Write([]byte("allocate")); err != nil {
+		t.Fatal(err)
+	}
+	echo := make([]byte, 8)
+	if _, err := io.ReadFull(conn, echo); err != nil || string(echo) != "allocate" {
+		t.Fatalf("relay answered %q, %v", echo, err)
 	}
 }

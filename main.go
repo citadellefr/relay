@@ -94,7 +94,14 @@ func main() {
 	// written
 	log.Printf("gateway up — domain *.%s, control %s (auth %s), proxy %s, client addresses %s",
 		domain, controlAddr, mode, proxyAddr, addrPolicy())
-	log.Fatalf("proxy: %v", runProxy(proxyLn, domain, reg, tenants))
+	turn := turnRelay{host: os.Getenv("TURN_HOST"), addr: os.Getenv("TURN_TLS_ADDR")}
+	if (turn.host == "") != (turn.addr == "") {
+		log.Fatalf("TURN_HOST and TURN_TLS_ADDR go together: set both or neither")
+	}
+	if turn.host != "" {
+		log.Printf("visio relay over TLS — %s on %s, relayed to %s", turn.host, proxyAddr, turn.addr)
+	}
+	log.Fatalf("proxy: %v", runProxy(proxyLn, domain, reg, tenants, turn))
 }
 
 // controlAuthMode reads CONTROL_MTLS. Left unset it keeps the historical

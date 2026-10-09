@@ -17,14 +17,36 @@ import (
 // tenant tunnel matching its SNI and copies bytes both ways. The tenant store
 // is only read to decide what deserves a log line;
 // routing itself is the registry's business.
-func runProxy(ln net.Listener, baseDomain string, reg *registry, tenants *tenantStore) error {
+func runProxy(ln net.Listener, baseDomain string, reg *registry, tenants *tenantStore, turn turnRelay) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go handleClient(conn, baseDomain, reg, tenants)
+		go handleClient(conn, baseDomain, reg, tenants, turn)
 	}
+}
+
+// turnRelay is the one name that is not a tenant's: the visio relay, reached
+// over TLS on this port by the clients whose network lets nothing else out —
+// a company firewall, a hotel's wifi. Routed like a tenant, bytes verbatim:
+// the relay terminates its own TLS at addr. An empty host routes nothing.
+type turnRelay struct {
+	host string
+	addr string
+}
+
+func (t turnRelay) serve(conn net.Conn, peeked []byte) {
+	relay, err := net.DialTimeout("tcp", t.addr, 10*time.Second)
+	if err != nil {
+		log.Printf("proxy: visio relay unreachable at %s: %v", t.addr, err)
+		return
+	}
+	defer relay.Close()
+	if _, err := relay.Write(peeked); err != nil {
+		return
+	}
+	pipe(conn, relay, nil)
 }
 
 var (
@@ -43,10 +65,14 @@ func logNoTunnel(tenant string, addr net.Addr) {
 	noTunnelMu.Unlock()
 }
 
-func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tenantStore) {
+func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tenantStore, turn turnRelay) {
 	defer conn.Close()
 	sni, peeked, err := peekClientHello(conn, 10*time.Second)
 	if err != nil {
+		return
+	}
+	if turn.host != "" && strings.EqualFold(sni, turn.host) {
+		turn.serve(conn, peeked)
 		return
 	}
 	tenant, sess := resolveTenant(sni, baseDomain, reg)

@@ -98,6 +98,9 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 		return
 	}
 	conn.SetDeadline(time.Time{})
+	if tc, ok := conn.(*tls.Conn); ok {
+		boundSendQueue(tc)
+	}
 
 	// the private gateway only starts yamux after reading the reply, but be
 	// safe with anything the bufio reader may already hold
