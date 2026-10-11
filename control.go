@@ -15,14 +15,25 @@ import (
 	"github.com/hashicorp/yamux"
 )
 
+// protocolVersion is the newest tunnel protocol spoken here. A private gateway
+// announces its own and gets back the one retained, the lower of the two; one
+// that announces none predates versions and is served as before.
+const protocolVersion = 1
+
 type authRequest struct {
+	V      int    `json:"v"`
 	Tenant string `json:"tenant"`
 	Token  string `json:"token"`
 }
 
+// authReply carries no reason beyond the refusal itself: saying whether the
+// tenant exists would hand an unauthenticated peer the list of tenants.
 type authReply struct {
 	OK    bool   `json:"ok"`
 	Error string `json:"error,omitempty"`
+	V     int    `json:"v,omitempty"`
+	// concurrent connections this tenant may hold, 0 = unlimited
+	MaxStreams int `json:"maxStreams,omitempty"`
 }
 
 // authMode is what the control plane accepts as proof of identity. The
@@ -93,7 +104,8 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 		conn.Close()
 		return
 	}
-	if err := writeReply(conn, authReply{OK: true}); err != nil {
+	reply := authReply{OK: true, V: min(max(req.V, 0), protocolVersion), MaxStreams: reg.lim.MaxStreams}
+	if err := writeReply(conn, reply); err != nil {
 		conn.Close()
 		return
 	}

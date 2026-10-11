@@ -27,8 +27,8 @@ TLS is terminated exclusively on the tenant's private gateway—never on the pub
                         +---------------------------------------------+
 ```
 
-1. **Control Plane (`:7000`)**: Tenant instances connect over TLS and authenticate either via a shared token (`tenants.json`) or via mTLS (X.509 client certificate). Once authenticated, the connection is upgraded to a yamux multiplexed session.
-2. **SNI Data Proxy (`:443`)**: Accepts raw TLS connections, extracts the hostname from the `ClientHello` (`<tenant>.<domain>` or `partage-<tenant>.<domain>`), injects a PROXY protocol v2 header (to pass along client IP information), and pipes the stream directly into the tenant's tunnel.
+1. **Control Plane (`:7000`)**: Tenant instances connect over TLS and authenticate either via a shared token (`tenants.json`) or via mTLS (X.509 client certificate). The handshake is one JSON line each way — `{"v":1,"tenant":"…","token":"…"}` answered by `{"ok":true,"v":1,"maxStreams":128}`: the protocol version retained (the lower of the two) and the tenant's stream cap. A refusal never says why. Once authenticated, the connection is upgraded to a yamux multiplexed session.
+2. **SNI Data Proxy (`:443`)**: Accepts raw TLS connections, extracts the hostname from the `ClientHello` (`<tenant>.<domain>` or `partage-<tenant>.<domain>`), injects a PROXY protocol v2 header (to pass along client IP information), and pipes the stream directly into the tenant's tunnel. A refusal is told as a plaintext TLS alert, never as a response: `unrecognized_name` when no tunnel serves the name, `internal_error` when the tunnel has no stream left.
 3. **HTTP Redirect (`:80`)**: Automatically redirects plain HTTP requests to HTTPS.
 4. **Health & Supervision (`:7001/healthz`)**: Local JSON endpoint exposing active tunnel states, stream counters, and authentication methods.
 

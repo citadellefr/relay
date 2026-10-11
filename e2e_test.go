@@ -686,6 +686,141 @@ func TestRedirectHardening(t *testing.T) {
 	}
 }
 
+// An upload sends for minutes while the server answers nothing, a download
+// the reverse: one silent direction is not an idle connection.
+func TestPipeOneWayTransferOutlivesIdleTimeout(t *testing.T) {
+	defer func(d time.Duration) { pipeIdleTimeout = d }(pipeIdleTimeout)
+	pipeIdleTimeout = 300 * time.Millisecond
+
+	client, proxyIn := net.Pipe()
+	proxyOut, server := net.Pipe()
+	defer client.Close()
+	defer server.Close()
+	done := make(chan struct{})
+	go func() {
+		pipe(proxyIn, proxyOut, nil)
+		close(done)
+	}()
+	go io.Copy(io.Discard, server)
+
+	for start := time.Now(); time.Since(start) < 3*pipeIdleTimeout; time.Sleep(50 * time.Millisecond) {
+		client.SetWriteDeadline(time.Now().Add(time.Second))
+		if _, err := client.Write([]byte("chunk")); err != nil {
+			t.Fatalf("transfer cut after %v: %v", time.Since(start).Round(10*time.Millisecond), err)
+		}
+	}
+
+	// once both directions are silent the connection is still reaped
+	select {
+	case <-done:
+	case <-time.After(3 * pipeIdleTimeout):
+		t.Fatal("idle connection never closed")
+	}
+}
+
+// A refusal reaches the client as a TLS alert, not as a closed socket: no
+// server behind one of our names, or no stream left in its tunnel. A name
+// that is not ours gets no answer at all.
+func TestRefusalIsATLSAlert(t *testing.T) {
+	const domain = "gw.test"
+	tenants := testTenantStore(t, map[string]string{"tenant1": "sekrit"})
+	reg := newRegistry(limits{MaxStreams: 1})
+	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controlLn.Close()
+	go runControl(controlLn, tenants, reg, testAuthLimiter(), authToken)
+	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer proxyLn.Close()
+	go runProxy(proxyLn, domain, reg, tenants, turnRelay{})
+	// the journal throttles that line per tenant, across tests
+	t.Cleanup(func() {
+		noTunnelMu.Lock()
+		delete(noTunnelLast, "tenant1")
+		noTunnelMu.Unlock()
+	})
+
+	handshake := func(name string) error {
+		c, err := net.Dial("tcp", proxyLn.Addr().String())
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer c.Close()
+		tc := tls.Client(c, &tls.Config{ServerName: name, InsecureSkipVerify: true})
+		tc.SetDeadline(time.Now().Add(3 * time.Second))
+		return tc.Handshake()
+	}
+	// crypto/tls does not export the alert it received, only its text
+	alertOf := func(err error) int {
+		switch {
+		case err == nil:
+			return -1
+		case strings.Contains(err.Error(), "tls: unrecognized name"):
+			return alertNoTunnel
+		case strings.Contains(err.Error(), "tls: internal error"):
+			return alertTunnelBusy
+		}
+		return 0
+	}
+
+	// declared or not, a name of ours without a tunnel answers the same
+	for _, name := range []string{"tenant1.gw.test", "nope.gw.test", "partage-tenant1.gw.test"} {
+		if got := alertOf(handshake(name)); got != alertNoTunnel {
+			t.Fatalf("%s: alert %d, want %d", name, got, alertNoTunnel)
+		}
+	}
+	if err := handshake("tenant1.elsewhere.test"); alertOf(err) != 0 {
+		t.Fatalf("a name that is not ours got an answer: %v", err)
+	}
+
+	startFakePrivateGateway(t, controlLn.Addr().String(), testCert(t, "tenant1.gw.test"), make(chan string, 1))
+	waitForTunnel(t, reg, "tenant1")
+	reg.acquireStream("tenant1")
+	if got := alertOf(handshake("tenant1.gw.test")); got != alertTunnelBusy {
+		t.Fatalf("tunnel at its cap: alert %d, want %d", got, alertTunnelBusy)
+	}
+}
+
+// The handshake settles a protocol version and tells the tenant its stream
+// cap; a private gateway that announces no version is served as before.
+func TestControlReplyVersionAndLimits(t *testing.T) {
+	reg := newRegistry(limits{MaxStreams: 128})
+	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer controlLn.Close()
+	go runControl(controlLn, testTenantStore(t, map[string]string{"tenant1": "sekrit"}), reg, testAuthLimiter(), authToken)
+
+	for announced, retained := range map[string]int{``: 0, `"v":1,`: 1, `"v":7,`: protocolVersion} {
+		conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{InsecureSkipVerify: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		fmt.Fprintf(conn, `{%s"tenant":"tenant1","token":"sekrit"}`+"\n", announced)
+		line, err := bufio.NewReader(conn).ReadString('\n')
+		conn.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		var reply authReply
+		if err := json.Unmarshal([]byte(line), &reply); err != nil {
+			t.Fatal(err)
+		}
+		if !reply.OK || reply.V != retained || reply.MaxStreams != 128 {
+			t.Fatalf("announced %q: reply %+v, want v=%d maxStreams=128", announced, reply, retained)
+		}
+	}
+}
+
 func TestPipeWriteDeadline(t *testing.T) {
 	c1, c2 := net.Pipe()
 	defer c1.Close()

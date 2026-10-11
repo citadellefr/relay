@@ -3,10 +3,12 @@ package main
 import (
 	"context"
 	"encoding/binary"
+	"errors"
 	"log"
 	"net"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -65,9 +67,35 @@ func logNoTunnel(tenant string, addr net.Addr) {
 	noTunnelMu.Unlock()
 }
 
+// pendingHellos bounds the connections that have not sent their ClientHello
+// yet: each one holds a goroutine and a descriptor for up to ten seconds, and
+// nothing else limits how many a single source opens.
+var pendingHellos = make(chan struct{}, 4096)
+
+// A refusal is told to the client as a TLS alert, the one thing this machine
+// can say without a certificate: a closed socket reads as "no network", and
+// the client could not tell a server that is off from a link that is down.
+// Alerts sent before the handshake are in the clear by design — nothing is
+// terminated here.
+const (
+	alertTunnelBusy = 80  // internal_error: the tunnel is there, not a free stream
+	alertNoTunnel   = 112 // unrecognized_name: no server behind this name now
+)
+
+func refuseTLS(conn net.Conn, alert byte) {
+	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+	conn.Write([]byte{0x15, 0x03, 0x03, 0x00, 0x02, 0x02, alert})
+}
+
 func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tenantStore, turn turnRelay) {
 	defer conn.Close()
+	select {
+	case pendingHellos <- struct{}{}:
+	default:
+		return
+	}
 	sni, peeked, err := peekClientHello(conn, 10*time.Second)
+	<-pendingHellos
 	if err != nil {
 		return
 	}
@@ -77,25 +105,30 @@ func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tena
 	}
 	tenant, sess := resolveTenant(sni, baseDomain, reg)
 	if sess == nil {
+		// any name of ours gets the same answer, declared tenant or not: the
+		// alert must not tell which names exist. Other names get nothing.
 		if knownTenant(tenant, tenants) {
 			logNoTunnel(tenant, conn.RemoteAddr())
+		}
+		if tenant != "" {
+			refuseTLS(conn, alertNoTunnel)
 		}
 		return
 	}
 	if !reg.acquireStream(tenant) {
+		refuseTLS(conn, alertTunnelBusy)
 		log.Printf("proxy: stream cap reached for %q, dropping %s", tenant, logAddr(conn.RemoteAddr()))
 		return
 	}
 	defer reg.releaseStream(tenant)
 	stream, err := sess.Open()
 	if err != nil {
+		refuseTLS(conn, alertTunnelBusy)
 		return
 	}
 	defer stream.Close()
-	if _, err := stream.Write(proxyHeader(conn)); err != nil {
-		return
-	}
-	if _, err := stream.Write(peeked); err != nil {
+	// one write, one yamux frame: the private side reads both together
+	if _, err := stream.Write(append(proxyHeader(conn), peeked...)); err != nil {
 		return
 	}
 	pipe(conn, stream, reg.bandwidth(tenant))
@@ -167,7 +200,8 @@ func proxyHeader(c net.Conn) []byte {
 	return binary.BigEndian.AppendUint16(hdr, uint16(dst.Port))
 }
 
-const pipeIdleTimeout = 5 * time.Minute
+// A variable only so that tests do not wait five minutes.
+var pipeIdleTimeout = 5 * time.Minute
 
 var copyBufPool = sync.Pool{
 	New: func() any {
@@ -180,14 +214,20 @@ func pipe(a, b net.Conn, lim *rate.Limiter) {
 	done := make(chan struct{}, 2)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+	// idleness is judged on both directions at once: an upload sends for
+	// minutes while the other side says nothing, and a download the reverse
+	var lastByte atomic.Int64
+	lastByte.Store(time.Now().UnixNano())
 	cp := func(dst, src net.Conn) {
 		bufPtr := copyBufPool.Get().(*[]byte)
 		buf := *bufPtr
 		defer copyBufPool.Put(bufPtr)
 		for {
-			src.SetReadDeadline(time.Now().Add(pipeIdleTimeout))
+			quietSince := time.Unix(0, lastByte.Load())
+			src.SetReadDeadline(quietSince.Add(pipeIdleTimeout))
 			n, err := src.Read(buf)
 			if n > 0 {
+				lastByte.Store(time.Now().UnixNano())
 				if lim != nil {
 					if werr := lim.WaitN(ctx, n); werr != nil {
 						break
@@ -197,6 +237,10 @@ func pipe(a, b net.Conn, lim *rate.Limiter) {
 				if _, werr := dst.Write(buf[:n]); werr != nil {
 					break
 				}
+			}
+			var timeout net.Error
+			if errors.As(err, &timeout) && timeout.Timeout() && lastByte.Load() != quietSince.UnixNano() {
+				continue
 			}
 			if err != nil {
 				break
