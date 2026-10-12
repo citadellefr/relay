@@ -1,13 +1,13 @@
 // Citadelle public gateway: a deliberately dumb byte router on a VPS.
 //
-// Private gateways dial CONTROL_ADDR, authenticate with a per-tenant token
-// (or a client certificate when CONTROL_CLIENT_CA is set) and keep a yamux
-// tunnel open. Clients hit PROXY_ADDR (:443) with plain HTTPS; the
+// Private gateways dial CONTROL_ADDR, authenticate with the client certificate
+// of their tenant (signed by CONTROL_CLIENT_CA) and keep a yamux tunnel open. Clients hit PROXY_ADDR (:443) with plain HTTPS; the
 // ClientHello SNI selects the tenant tunnel and bytes are copied verbatim —
 // TLS is terminated by the private gateway, never here.
 //
-// SIGHUP reloads TENANTS_FILE: new tenants can connect, removed tenants get
-// their tunnel closed, live tunnels of unchanged tenants are untouched.
+// SIGHUP reloads TENANTS_FILE: new tenants can connect, tenants removed or
+// bound to another key get their tunnel closed, live tunnels of unchanged
+// tenants are untouched.
 package main
 
 import (
@@ -34,9 +34,8 @@ func main() {
 	proxyAddr := envStr("PROXY_ADDR", ":443")
 	httpAddr := envStr("HTTP_ADDR", ":80")
 	healthAddr := envStr("HEALTH_ADDR", "127.0.0.1:7001")
-	clientCA := os.Getenv("CONTROL_CLIENT_CA")
-	mode, err := controlAuthMode(os.Getenv("CONTROL_MTLS"), clientCA)
-	if err != nil {
+	clientCA := mustEnv("CONTROL_CLIENT_CA")
+	if err := checkControlMTLS(os.Getenv("CONTROL_MTLS")); err != nil {
 		log.Fatalf("control auth: %v", err)
 	}
 
@@ -57,22 +56,15 @@ func main() {
 	// 10 auth failures per minute per IP before drops kick in
 	authLim := newFailLimiter(10, time.Minute)
 
+	clientCAs, err := loadCertPool(clientCA)
+	if err != nil {
+		log.Fatalf("control client CA: %v", err)
+	}
 	controlTLS := &tls.Config{
 		Certificates: []tls.Certificate{cert},
 		MinVersion:   tls.VersionTLS12,
-	}
-	if clientCA != "" {
-		pool, err := loadCertPool(clientCA)
-		if err != nil {
-			log.Fatalf("control client CA: %v", err)
-		}
-		controlTLS.ClientCAs = pool
-		// in transition a gateway without a certificate must still reach the
-		// auth line; one that has a bad certificate is refused by the TLS layer
-		controlTLS.ClientAuth = tls.VerifyClientCertIfGiven
-		if mode == authMTLS {
-			controlTLS.ClientAuth = tls.RequireAndVerifyClientCert
-		}
+		ClientCAs:    clientCAs,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 	}
 	controlLn, err := tls.Listen("tcp", controlAddr, controlTLS)
 	if err != nil {
@@ -89,11 +81,11 @@ func main() {
 	if healthAddr != "" {
 		go func() { log.Fatalf("health: %v", runHealth(healthAddr, reg)) }()
 	}
-	go func() { log.Fatalf("control: %v", runControl(controlLn, tenants, reg, authLim, mode)) }()
+	go func() { log.Fatalf("control: %v", runControl(controlLn, tenants, reg, authLim)) }()
 	// the address policy is logged so a journal proves under which one it was
 	// written
-	log.Printf("gateway up — domain *.%s, control %s (auth %s), proxy %s, client addresses %s",
-		domain, controlAddr, mode, proxyAddr, addrPolicy())
+	log.Printf("gateway up — domain *.%s, control %s (mTLS), proxy %s, client addresses %s",
+		domain, controlAddr, proxyAddr, addrPolicy())
 	turn := turnRelay{host: os.Getenv("TURN_HOST"), addr: os.Getenv("TURN_TLS_ADDR")}
 	if (turn.host == "") != (turn.addr == "") {
 		log.Fatalf("TURN_HOST and TURN_TLS_ADDR go together: set both or neither")
@@ -104,31 +96,13 @@ func main() {
 	log.Fatalf("proxy: %v", runProxy(proxyLn, domain, reg, tenants, turn))
 }
 
-// controlAuthMode reads CONTROL_MTLS. Left unset it keeps the historical
-// behaviour — a client CA means client certificates are required — so that
-// enabling the PKI is never accidentally weaker than before.
-func controlAuthMode(v, clientCA string) (authMode, error) {
-	if v == "" {
-		if clientCA != "" {
-			return authMTLS, nil
-		}
-		return authToken, nil
+// checkControlMTLS refuses the modes that let a token in. They are gone, and
+// a deployment still asking for one must not start as if it had been heard.
+func checkControlMTLS(v string) error {
+	if v != "" && v != "require" {
+		return fmt.Errorf("CONTROL_MTLS=%s: client certificates are the only way in, unset it or set require", v)
 	}
-	var mode authMode
-	switch v {
-	case "off":
-		mode = authToken
-	case "transition":
-		mode = authTransition
-	case "require":
-		mode = authMTLS
-	default:
-		return authToken, fmt.Errorf("CONTROL_MTLS: want off, transition or require, got %q", v)
-	}
-	if (mode == authToken) != (clientCA == "") {
-		return authToken, fmt.Errorf("CONTROL_MTLS=%s and CONTROL_CLIENT_CA disagree: set both or neither", v)
-	}
-	return mode, nil
+	return nil
 }
 
 func loadCertPool(path string) (*x509.CertPool, error) {

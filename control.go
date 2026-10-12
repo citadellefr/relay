@@ -2,14 +2,14 @@ package main
 
 import (
 	"bufio"
+	"crypto/ed25519"
 	"crypto/sha256"
-	"crypto/subtle"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/hex"
 	"encoding/json"
 	"log"
 	"net"
-	"strings"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -20,10 +20,9 @@ import (
 // that announces none predates versions and is served as before.
 const protocolVersion = 1
 
+// authRequest names no tenant: the client certificate does.
 type authRequest struct {
-	V      int    `json:"v"`
-	Tenant string `json:"tenant"`
-	Token  string `json:"token"`
+	V int `json:"v"`
 }
 
 // authReply carries no reason beyond the refusal itself: saying whether the
@@ -36,44 +35,22 @@ type authReply struct {
 	MaxStreams int `json:"maxStreams,omitempty"`
 }
 
-// authMode is what the control plane accepts as proof of identity. The
-// migration to mTLS cannot be a flag day — the private gateways are updated
-// one at a time — hence the middle state, where a gateway that has no
-// certificate yet still gets in with its token.
-type authMode int
-
-const (
-	authToken      authMode = iota // tenants.json token, the historical default
-	authTransition                 // client certificate if offered, token otherwise
-	authMTLS                       // client certificate only
-)
-
-func (m authMode) String() string {
-	switch m {
-	case authTransition:
-		return "transition"
-	case authMTLS:
-		return "mtls"
-	}
-	return "token"
-}
-
 // runControl accepts the persistent connections opened by private gateways:
 // one JSON auth line, then the connection becomes a yamux session used to
-// reach the tenant. The listener is expected to be TLS. Under mtls the client
-// certificate (already verified by the TLS layer) carries the tenant identity
-// and replaces the shared token.
-func runControl(ln net.Listener, tenants *tenantStore, reg *registry, authLim *failLimiter, mode authMode) error {
+// reach the tenant. The listener is TLS and requires a client certificate,
+// already verified against the tunnel CA when the line is read: it carries the
+// tenant identity.
+func runControl(ln net.Listener, tenants *tenantStore, reg *registry, authLim *failLimiter) error {
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			return err
 		}
-		go handleControl(conn, tenants, reg, authLim, mode)
+		go handleControl(conn, tenants, reg, authLim)
 	}
 }
 
-func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *failLimiter, mode authMode) {
+func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *failLimiter) {
 	if authLim.blocked(conn.RemoteAddr()) {
 		conn.Close()
 		return
@@ -94,12 +71,12 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 		conn.Close()
 		return
 	}
-	method := authenticate(conn, tenants, req, mode)
-	if method == "" {
+	tenant, key := authenticate(conn, tenants)
+	if key == "" {
 		writeReply(conn, authReply{Error: "auth failed"})
 		// full address on purpose: this is the security journal of the control
 		// plane, and host-level banning reads these lines
-		log.Printf("control: auth failed for %q from %s", req.Tenant, conn.RemoteAddr())
+		log.Printf("control: auth failed for %q from %s", tenant, conn.RemoteAddr())
 		authLim.fail(conn.RemoteAddr())
 		conn.Close()
 		return
@@ -121,50 +98,44 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 		conn.Close()
 		return
 	}
-	reg.register(req.Tenant, sess, method)
-	// the method is logged so the journal answers the only question that
-	// decides when the fleet can move to CONTROL_MTLS=require
-	log.Printf("control: tenant %q connected from %s (auth %s)", req.Tenant, conn.RemoteAddr(), method)
+	reg.register(tenant, sess, key)
+	// a revocation that landed between the check and the registration would
+	// otherwise leave this tunnel standing until the next reload
+	if tenants.key(tenant) != key {
+		sess.Close()
+	}
+	log.Printf("control: tenant %q connected from %s", tenant, conn.RemoteAddr())
 	<-sess.CloseChan()
-	reg.unregister(req.Tenant, sess)
-	log.Printf("control: tenant %q disconnected", req.Tenant)
+	reg.unregister(tenant, sess)
+	log.Printf("control: tenant %q disconnected", tenant)
 }
 
-// authenticate returns how the peer proved who it is ("mtls" or "token"), or
-// "" when it did not.
-func authenticate(conn net.Conn, tenants *tenantStore, req authRequest, mode authMode) string {
-	if mode != authToken {
-		if certs := peerCertificates(conn); len(certs) > 0 {
-			if certMatchesTenant(certs[0], req.Tenant) && tenants.has(req.Tenant) {
-				return "mtls"
-			}
-			return ""
-		}
-		if mode == authMTLS {
-			return ""
-		}
+// authenticate returns the tenant the certificate names and the id of its
+// key, the latter empty unless tenants.json binds that tenant to that key.
+// The CA says who the peer is, the file says whether it is still welcome.
+func authenticate(conn net.Conn, tenants *tenantStore) (tenant, key string) {
+	certs := peerCertificates(conn)
+	if len(certs) == 0 {
+		return "", ""
 	}
-	want := tenants.token(req.Tenant)
-	wantSum := sha256.Sum256([]byte(want))
-	gotSum := sha256.Sum256([]byte(req.Token))
-	match := subtle.ConstantTimeCompare(wantSum[:], gotSum[:]) == 1
-	if match && want != "" {
-		return "token"
+	tenant = certs[0].Subject.CommonName
+	key = keyID(certs[0])
+	if key == "" || tenants.key(tenant) != key {
+		return tenant, ""
 	}
-	return ""
+	return tenant, key
 }
 
-func certMatchesTenant(cert *x509.Certificate, tenant string) bool {
-	norm := strings.ToLower(tenant)
-	if strings.ToLower(cert.Subject.CommonName) == norm {
-		return true
+// keyID is hex(SHA-256(public key)) of an Ed25519 certificate, "" for any
+// other kind: the same id a server computes from its seed to fetch its
+// certificate.
+func keyID(cert *x509.Certificate) string {
+	pub, ok := cert.PublicKey.(ed25519.PublicKey)
+	if !ok {
+		return ""
 	}
-	for _, name := range cert.DNSNames {
-		if strings.ToLower(name) == norm {
-			return true
-		}
-	}
-	return false
+	sum := sha256.Sum256(pub)
+	return hex.EncodeToString(sum[:])
 }
 
 func peerCertificates(conn net.Conn) []*x509.Certificate {

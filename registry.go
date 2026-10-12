@@ -21,7 +21,7 @@ type tenantState struct {
 	connects      uint64
 	activeStreams int
 	totalStreams  uint64
-	auth          string        // how it last authenticated: "mtls" or "token"
+	key           string        // key id the live session authenticated with
 	bandwidth     *rate.Limiter // nil when unlimited
 }
 
@@ -52,14 +52,14 @@ func (r *registry) state(tenant string) *tenantState {
 
 // register replaces any previous session for the tenant: a fast reconnect
 // can arrive before the dead session is detected by keepalive.
-func (r *registry) register(tenant string, s *yamux.Session, auth string) {
+func (r *registry) register(tenant string, s *yamux.Session, key string) {
 	r.mu.Lock()
 	st := r.state(tenant)
 	old := st.sess
 	st.sess = s
 	st.connectedAt = time.Now()
 	st.connects++
-	st.auth = auth
+	st.key = key
 	r.mu.Unlock()
 	if old != nil && old != s {
 		old.Close()
@@ -112,19 +112,21 @@ func (r *registry) bandwidth(tenant string) *rate.Limiter {
 	return r.state(tenant).bandwidth
 }
 
-// closeRemoved closes the tunnels of tenants absent from valid and drops
-// their state. Returns how many tunnels were closed.
-func (r *registry) closeRemoved(valid map[string]bool) int {
+// closeRevoked closes the tunnels keys no longer allows — tenant absent, or
+// bound to another key than the one its session came in with — and drops the
+// state of absent tenants. Returns how many tunnels were closed.
+func (r *registry) closeRevoked(keys map[string]string) int {
 	r.mu.Lock()
 	var doomed []*yamux.Session
 	for id, st := range r.tenants {
-		if valid[id] {
-			continue
-		}
-		if st.sess != nil {
+		key, known := keys[id]
+		if st.sess != nil && (!known || st.key != key) {
 			doomed = append(doomed, st.sess)
+			st.sess = nil
 		}
-		delete(r.tenants, id)
+		if !known {
+			delete(r.tenants, id)
+		}
 	}
 	r.mu.Unlock()
 	for _, s := range doomed {
@@ -140,9 +142,6 @@ type tenantStats struct {
 	Connects      uint64    `json:"connects"`
 	ActiveStreams int       `json:"activeStreams"`
 	TotalStreams  uint64    `json:"totalStreams"`
-	// how the tunnel last authenticated: the fleet can move to
-	// CONTROL_MTLS=require the day none of them says "token" any more
-	Auth string `json:"auth,omitempty"`
 }
 
 func (r *registry) snapshot() map[string]tenantStats {
@@ -155,7 +154,6 @@ func (r *registry) snapshot() map[string]tenantStats {
 			Connects:      st.connects,
 			ActiveStreams: st.activeStreams,
 			TotalStreams:  st.totalStreams,
-			Auth:          st.auth,
 		}
 		if st.sess != nil {
 			s.ConnectedAt = st.connectedAt

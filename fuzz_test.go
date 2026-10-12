@@ -86,10 +86,10 @@ func FuzzPeekClientHello(f *testing.F) {
 // (that would be the routing loop).
 func FuzzResolveTenant(f *testing.F) {
 	const domain = "gw.test"
-	tenants := testTenantStore(f, map[string]string{"tenant1": "a", "partage-legitime": "b"})
+	tenants := testTenantStore(f, map[string]string{"tenant1": testKey, "partage-legitime": testKey})
 	reg := newRegistry(limits{})
-	for id := range tenants.ids() {
-		reg.register(id, &yamux.Session{}, "token")
+	for id := range tenants.all() {
+		reg.register(id, &yamux.Session{}, testKey)
 	}
 
 	for _, seed := range []string{

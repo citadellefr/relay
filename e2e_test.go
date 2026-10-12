@@ -3,10 +3,13 @@ package main
 import (
 	"bufio"
 	"context"
+	"crypto/ed25519"
 	"crypto/tls"
 	"crypto/x509"
+	"encoding/base32"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/pem"
 	"fmt"
 	"io"
 	"net"
@@ -15,6 +18,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -41,22 +45,56 @@ func testTenantStore(t testing.TB, tenants map[string]string) *tenantStore {
 
 func testAuthLimiter() *failLimiter { return newFailLimiter(10, time.Minute) }
 
-// Full path: https client → SNI proxy → tunnel → fake private gateway that
-// terminates TLS and answers HTTP.
-func TestEndToEnd(t *testing.T) {
-	const domain = "gw.test"
-	tenants := testTenantStore(t, map[string]string{"tenant1": "sekrit"})
-	reg := newRegistry(limits{})
+// testKey stands for a key id where no tunnel is ever opened.
+var testKey = strings.Repeat("0", 64)
 
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
+// startControl runs the control plane with these certificates as its CA and
+// each tenant they name bound to its key, the last one given when two name
+// the same tenant.
+func startControl(t *testing.T, reg *registry, lim *failLimiter, clients ...tls.Certificate) (net.Listener, *tenantStore) {
+	t.Helper()
+	pool := x509.NewCertPool()
+	keys := map[string]string{}
+	for _, c := range clients {
+		pool.AddCert(c.Leaf)
+		keys[c.Leaf.Subject.CommonName] = keyID(c.Leaf)
+	}
+	ln, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
 		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
 		MinVersion:   tls.VersionTLS12,
+		ClientCAs:    pool,
+		ClientAuth:   tls.RequireAndVerifyClientCert,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	defer controlLn.Close()
-	go runControl(controlLn, tenants, reg, testAuthLimiter(), authToken)
+	t.Cleanup(func() { ln.Close() })
+	store := testTenantStore(t, keys)
+	go runControl(ln, store, reg, lim)
+	return ln, store
+}
+
+// controlAuth opens a control connection, sends one auth line and returns the
+// reply. The connection stays open for the test to look at the tunnel.
+func controlAuth(t *testing.T, ln net.Listener, line string, certs ...tls.Certificate) (string, error) {
+	t.Helper()
+	conn, err := tls.Dial("tcp", ln.Addr().String(), &tls.Config{InsecureSkipVerify: true, Certificates: certs})
+	if err != nil {
+		return "", err
+	}
+	t.Cleanup(func() { conn.Close() })
+	conn.SetDeadline(time.Now().Add(3 * time.Second))
+	fmt.Fprintln(conn, line)
+	return bufio.NewReader(conn).ReadString('\n')
+}
+
+// Full path: https client → SNI proxy → tunnel → fake private gateway that
+// terminates TLS and answers HTTP.
+func TestEndToEnd(t *testing.T) {
+	const domain = "gw.test"
+	reg := newRegistry(limits{})
+	clientCert := testClientCert(t, "tenant1")
+	controlLn, tenants := startControl(t, reg, testAuthLimiter(), clientCert)
 
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -67,7 +105,7 @@ func TestEndToEnd(t *testing.T) {
 
 	tenantCert := testCert(t, "tenant1.gw.test")
 	proxyHdr := make(chan string, 1)
-	startFakePrivateGateway(t, controlLn.Addr().String(), tenantCert, proxyHdr)
+	startFakePrivateGateway(t, controlLn.Addr().String(), clientCert, tenantCert, proxyHdr)
 
 	waitForTunnel(t, reg, "tenant1")
 
@@ -128,33 +166,42 @@ func TestEndToEnd(t *testing.T) {
 	}
 }
 
+// A certificate our CA signed is not enough: tenants.json binds the tenant to
+// one key, so the certificate of a seed that was replaced opens nothing.
 func TestControlAuthFailure(t *testing.T) {
 	reg := newRegistry(limits{})
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
-		MinVersion:   tls.VersionTLS12,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlLn.Close()
-	go runControl(controlLn, testTenantStore(t, map[string]string{"tenant1": "sekrit"}), reg, testAuthLimiter(), authToken)
+	replaced, current := testClientCert(t, "tenant1"), testClientCert(t, "tenant1")
+	controlLn, _ := startControl(t, reg, testAuthLimiter(), replaced, current)
 
-	conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{InsecureSkipVerify: true})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	fmt.Fprintf(conn, `{"tenant":"tenant1","token":"wrong"}`+"\n")
-	line, err := bufio.NewReader(conn).ReadString('\n')
+	line, err := controlAuth(t, controlLn, `{"v":1}`, replaced)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(line, `"ok":true`) {
-		t.Fatalf("auth accepted with a wrong token: %q", line)
+		t.Fatalf("auth accepted with the key tenants.json no longer names: %q", line)
 	}
 	if reg.lookup("tenant1") != nil {
 		t.Fatal("session registered despite failed auth")
+	}
+	if line, err := controlAuth(t, controlLn, `{"v":1}`, current); err != nil || !strings.Contains(line, `"ok":true`) {
+		t.Fatalf("auth refused with the bound key: %q, %v", line, err)
+	}
+}
+
+// No token path is left: a peer without a certificate never gets a reply.
+func TestControlRequiresCertificate(t *testing.T) {
+	reg := newRegistry(limits{})
+	controlLn, _ := startControl(t, reg, testAuthLimiter(), testClientCert(t, "tenant1"))
+
+	if line, err := controlAuth(t, controlLn, `{"tenant":"tenant1","token":"sekrit"}`); err == nil {
+		t.Fatalf("a peer without a certificate was answered: %q", line)
+	}
+	stranger := testClientCert(t, "tenant1")
+	if line, err := controlAuth(t, controlLn, `{"v":1}`, stranger); err == nil {
+		t.Fatalf("a certificate from another CA was answered: %q", line)
+	}
+	if reg.lookup("tenant1") != nil {
+		t.Fatal("session registered without a valid certificate")
 	}
 }
 
@@ -162,178 +209,102 @@ func TestControlAuthFailure(t *testing.T) {
 // are dropped before the auth reply.
 func TestControlAuthRateLimit(t *testing.T) {
 	reg := newRegistry(limits{})
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
-		MinVersion:   tls.VersionTLS12,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlLn.Close()
-	go runControl(controlLn, testTenantStore(t, map[string]string{"tenant1": "sekrit"}), reg, newFailLimiter(3, time.Minute), authToken)
+	replaced := testClientCert(t, "tenant1")
+	controlLn, _ := startControl(t, reg, newFailLimiter(3, time.Minute), replaced, testClientCert(t, "tenant1"))
 
-	attempt := func() (string, error) {
-		conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{InsecureSkipVerify: true})
-		if err != nil {
-			return "", err
-		}
-		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
-		fmt.Fprintf(conn, `{"tenant":"tenant1","token":"wrong"}`+"\n")
-		return bufio.NewReader(conn).ReadString('\n')
-	}
 	for range 3 {
-		if _, err := attempt(); err != nil {
+		if _, err := controlAuth(t, controlLn, `{"v":1}`, replaced); err != nil {
 			t.Fatalf("expected an auth reply while under the limit: %v", err)
 		}
 	}
-	if line, err := attempt(); err == nil {
+	if line, err := controlAuth(t, controlLn, `{"v":1}`, replaced); err == nil {
 		t.Fatalf("expected a dropped connection over the limit, got %q", line)
 	}
 }
 
-// With mTLS the client certificate CN is the identity: the token is ignored
-// and claiming another tenant than the CN is refused.
-func TestControlMTLS(t *testing.T) {
-	clientCert := testClientCert(t, "tenant1")
-	pool := x509.NewCertPool()
-	pool.AddCert(clientCert.Leaf)
-
+// The certificate CN is the identity: whatever tenant the auth line claims,
+// the tunnel is the one of the tenant the certificate names.
+func TestControlTenantFromCertificate(t *testing.T) {
 	reg := newRegistry(limits{})
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
-		MinVersion:   tls.VersionTLS12,
-		ClientCAs:    pool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlLn.Close()
-	store := testTenantStore(t, map[string]string{"tenant1": "unused", "tenant2": "unused"})
-	go runControl(controlLn, store, reg, testAuthLimiter(), authMTLS)
+	cert1 := testClientCert(t, "tenant1")
+	controlLn, _ := startControl(t, reg, testAuthLimiter(), cert1, testClientCert(t, "tenant2"))
 
-	attempt := func(tenant string) string {
-		conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{
-			InsecureSkipVerify: true,
-			Certificates:       []tls.Certificate{clientCert},
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		defer conn.Close()
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
-		fmt.Fprintf(conn, `{"tenant":"%s","token":"ignored"}`+"\n", tenant)
-		line, err := bufio.NewReader(conn).ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		return line
-	}
-	if line := attempt("tenant1"); !strings.Contains(line, `"ok":true`) {
-		t.Fatalf("mTLS auth refused for the CN tenant: %q", line)
-	}
-	if line := attempt("tenant2"); strings.Contains(line, `"ok":true`) {
-		t.Fatalf("mTLS auth accepted for a tenant not matching the CN: %q", line)
-	}
-}
-
-// The migration state: the fleet is converted one gateway at a time, so a
-// certificate is used when there is one and the token still works when there
-// is none. What must not happen is a certificate opening a door it does not
-// name.
-func TestControlMTLSTransition(t *testing.T) {
-	clientCert := testClientCert(t, "tenant1")
-	pool := x509.NewCertPool()
-	pool.AddCert(clientCert.Leaf)
-
-	reg := newRegistry(limits{})
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
-		MinVersion:   tls.VersionTLS12,
-		ClientCAs:    pool,
-		ClientAuth:   tls.VerifyClientCertIfGiven,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlLn.Close()
-	store := testTenantStore(t, map[string]string{"tenant1": "token1", "tenant2": "token2"})
-	go runControl(controlLn, store, reg, testAuthLimiter(), authTransition)
-
-	attempt := func(certs []tls.Certificate, tenant, token string) string {
-		conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{
-			InsecureSkipVerify: true,
-			Certificates:       certs,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		// kept open: the tunnel has to still be there to be looked at
-		t.Cleanup(func() { conn.Close() })
-		conn.SetDeadline(time.Now().Add(3 * time.Second))
-		fmt.Fprintf(conn, `{"tenant":%q,"token":%q}`+"\n", tenant, token)
-		line, err := bufio.NewReader(conn).ReadString('\n')
-		if err != nil {
-			t.Fatal(err)
-		}
-		return line
-	}
-	migrated := []tls.Certificate{clientCert}
-
-	// already migrated: the certificate decides and the token is not looked at
-	if line := attempt(migrated, "tenant1", "wrong"); !strings.Contains(line, `"ok":true`) {
-		t.Fatalf("certificate refused in transition: %q", line)
+	line, err := controlAuth(t, controlLn, `{"v":1,"tenant":"tenant2"}`, cert1)
+	if err != nil || !strings.Contains(line, `"ok":true`) {
+		t.Fatalf("auth refused for the tenant of the certificate: %q, %v", line, err)
 	}
 	waitForTunnel(t, reg, "tenant1")
-	if got := reg.snapshot()["tenant1"].Auth; got != "mtls" {
-		t.Fatalf("tenant1 authenticated by %q, want mtls", got)
-	}
-
-	// not migrated yet: no certificate, the token still gets it in
-	if line := attempt(nil, "tenant2", "token2"); !strings.Contains(line, `"ok":true`) {
-		t.Fatalf("token refused in transition: %q", line)
-	}
-	waitForTunnel(t, reg, "tenant2")
-	if got := reg.snapshot()["tenant2"].Auth; got != "token" {
-		t.Fatalf("tenant2 authenticated by %q, want token", got)
-	}
-
-	// a certificate claiming another tenant stays refused even with that
-	// tenant's token: presenting one is a commitment, not an option
-	if line := attempt(migrated, "tenant2", "token2"); strings.Contains(line, `"ok":true`) {
-		t.Fatalf("certificate of tenant1 accepted as tenant2: %q", line)
+	if reg.lookup("tenant2") != nil {
+		t.Fatal("the certificate of tenant1 opened the tunnel of tenant2")
 	}
 }
 
-// What deploy/pki.sh issues has to be what control.go accepts: a key usage or
-// a CA shape the TLS layer refuses would only show up on the VPS, the day the
-// fleet is switched over.
+// Only an Ed25519 key has an id, and a key without one must match nothing —
+// not even a tenant that tenants.json does not know.
+func TestKeyID(t *testing.T) {
+	if id := keyID(testClientCert(t, "tenant1").Leaf); !validKeyID(id) {
+		t.Fatalf("key id of an Ed25519 certificate = %q", id)
+	}
+	if id := keyID(testCert(t, "tenant1").Leaf); id != "" {
+		t.Fatalf("key id of a P-256 certificate = %q, want none", id)
+	}
+}
+
+// What deploy/pki.sh hands out has to be what control.go accepts, by the road
+// a server takes: the key typed from the customer sheet gives the private key,
+// the certificate was signed for it in advance, and the id printed next to it
+// is what tenants.json holds.
 func TestPKICertificateAccepted(t *testing.T) {
 	if _, err := exec.LookPath("openssl"); err != nil {
 		t.Skip("openssl not installed")
 	}
 	dir := t.TempDir()
-	pki := func(args ...string) {
+	pki := func(args ...string) string {
 		t.Helper()
 		cmd := exec.Command("./deploy/pki.sh", args...)
 		cmd.Env = append(os.Environ(), "PKI_DIR="+dir)
-		if out, err := cmd.CombinedOutput(); err != nil {
+		out, err := cmd.CombinedOutput()
+		if err != nil {
 			t.Fatalf("pki.sh %v: %v\n%s", args, err, out)
 		}
+		return string(out)
 	}
 	pki("init")
-	pki("issue", "tenant1")
+	sheet := pki("issue", "tenant1")
 
-	clientCert, err := tls.LoadX509KeyPair(filepath.Join(dir, "tenant1.crt"), filepath.Join(dir, "tenant1.key"))
+	typed := regexp.MustCompile(`(?m)^\s+((?:[A-Z2-7]{4} ){12}[A-Z2-7]{4})$`).FindStringSubmatch(sheet)
+	if typed == nil {
+		t.Fatalf("no key in the customer sheet:\n%s", sheet)
+	}
+	seed, err := base32.StdEncoding.WithPadding(base32.NoPadding).DecodeString(strings.ReplaceAll(typed[1], " ", ""))
+	if err != nil || len(seed) != ed25519.SeedSize {
+		t.Fatalf("the key of the sheet is not a 32-byte seed: %v", err)
+	}
+	key := ed25519.NewKeyFromSeed(seed)
+
+	pemBytes, err := os.ReadFile(filepath.Join(dir, "tenant1.crt"))
 	if err != nil {
 		t.Fatal(err)
 	}
+	block, _ := pem.Decode(pemBytes)
+	leaf, err := x509.ParseCertificate(block.Bytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !key.Public().(ed25519.PublicKey).Equal(leaf.PublicKey) {
+		t.Fatal("the certificate was not signed for the key of the sheet")
+	}
+	if !strings.Contains(sheet, keyID(leaf)) {
+		t.Fatalf("the sheet does not print the key id %s:\n%s", keyID(leaf), sheet)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 4 {
+		t.Fatalf("want ca.crt, ca.key, ca.srl and tenant1.crt only, got %v", entries)
+	}
+
 	pool, err := loadCertPool(filepath.Join(dir, "ca.crt"))
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	reg := newRegistry(limits{})
 	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
 		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
@@ -345,58 +316,32 @@ func TestPKICertificateAccepted(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer controlLn.Close()
-	store := testTenantStore(t, map[string]string{"tenant1": "unused"})
-	go runControl(controlLn, store, reg, testAuthLimiter(), authMTLS)
+	store := testTenantStore(t, map[string]string{"tenant1": keyID(leaf)})
+	go runControl(controlLn, store, reg, testAuthLimiter())
 
-	conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{
-		InsecureSkipVerify: true,
-		Certificates:       []tls.Certificate{clientCert},
-	})
+	clientCert := tls.Certificate{Certificate: [][]byte{block.Bytes}, PrivateKey: key}
+	line, err := controlAuth(t, controlLn, `{"v":1}`, clientCert)
 	if err != nil {
 		t.Fatalf("the control plane refused a certificate issued by pki.sh: %v", err)
-	}
-	defer conn.Close()
-	conn.SetDeadline(time.Now().Add(3 * time.Second))
-	fmt.Fprintf(conn, `{"tenant":"tenant1","token":""}`+"\n")
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		t.Fatal(err)
 	}
 	if !strings.Contains(line, `"ok":true`) {
 		t.Fatalf("auth refused: %q", line)
 	}
 }
 
-func TestControlAuthMode(t *testing.T) {
-	cases := []struct {
-		env, ca string
-		want    authMode
-		bad     bool
-	}{
-		{"", "", authToken, false},
-		{"", "ca.pem", authMTLS, false}, // unchanged from before CONTROL_MTLS existed
-		{"off", "", authToken, false},
-		{"transition", "ca.pem", authTransition, false},
-		{"require", "ca.pem", authMTLS, false},
-		{"require", "", 0, true}, // nothing to verify certificates against
-		{"off", "ca.pem", 0, true},
-		{"yes", "ca.pem", 0, true},
-	}
-	for _, c := range cases {
-		mode, err := controlAuthMode(c.env, c.ca)
-		if (err != nil) != c.bad {
-			t.Errorf("controlAuthMode(%q, %q) error = %v, want bad = %v", c.env, c.ca, err, c.bad)
-			continue
-		}
-		if err == nil && mode != c.want {
-			t.Errorf("controlAuthMode(%q, %q) = %v, want %v", c.env, c.ca, mode, c.want)
+func TestCheckControlMTLS(t *testing.T) {
+	for v, bad := range map[string]bool{"": false, "require": false, "off": true, "transition": true, "yes": true} {
+		if err := checkControlMTLS(v); (err != nil) != bad {
+			t.Errorf("checkControlMTLS(%q) = %v, want refused = %v", v, err, bad)
 		}
 	}
 }
 
-// Reloading the store closes the tunnels of removed tenants only.
+// Reloading the store closes the tunnels it no longer allows — tenant removed,
+// or bound to another key — and those only.
 func TestTenantReloadRevokes(t *testing.T) {
-	store := testTenantStore(t, map[string]string{"keep": "a", "gone": "b"})
+	keyA, keyB := strings.Repeat("a", 64), strings.Repeat("b", 64)
+	store := testTenantStore(t, map[string]string{"keep": keyA, "gone": keyA, "rekeyed": keyA})
 	reg := newRegistry(limits{})
 
 	mk := func() *yamux.Session {
@@ -409,29 +354,57 @@ func TestTenantReloadRevokes(t *testing.T) {
 		}
 		return sess
 	}
-	keep, gone := mk(), mk()
-	reg.register("keep", keep, "token")
-	reg.register("gone", gone, "token")
+	keep, gone, rekeyed := mk(), mk(), mk()
+	reg.register("keep", keep, keyA)
+	reg.register("gone", gone, keyA)
+	reg.register("rekeyed", rekeyed, keyA)
 
-	if err := os.WriteFile(store.path, []byte(`{"keep":"a"}`), 0o600); err != nil {
+	raw, _ := json.Marshal(map[string]string{"keep": keyA, "rekeyed": keyB})
+	if err := os.WriteFile(store.path, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := store.reload(); err != nil {
-		t.Fatal(err)
-	}
-	if n := reg.closeRemoved(store.ids()); n != 1 {
-		t.Fatalf("closeRemoved = %d, want 1", n)
-	}
+	store.apply(reg, t.Logf)
 	if reg.lookup("keep") != keep {
 		t.Fatal("kept tenant lost its tunnel")
 	}
-	if reg.lookup("gone") != nil {
-		t.Fatal("removed tenant still routed")
+	for name, sess := range map[string]*yamux.Session{"gone": gone, "rekeyed": rekeyed} {
+		if reg.lookup(name) != nil {
+			t.Fatalf("%s: revoked tenant still routed", name)
+		}
+		select {
+		case <-sess.CloseChan():
+		case <-time.After(2 * time.Second):
+			t.Fatalf("%s: revoked session not closed", name)
+		}
 	}
-	select {
-	case <-gone.CloseChan():
-	case <-time.After(2 * time.Second):
-		t.Fatal("removed tenant session not closed")
+
+	// neither a file still holding tokens nor one emptied by accident is
+	// taken: the running set stays
+	for _, broken := range []string{"", "null", `{"keep":`} {
+		if err := os.WriteFile(store.path, []byte(broken), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := store.reload(); err == nil {
+			t.Fatalf("tenants file %q was accepted", broken)
+		}
+	}
+	if err := os.WriteFile(store.path, []byte(`{"keep":"un-ancien-jeton"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.reload(); err == nil {
+		t.Fatal("a tenants file without key ids was accepted")
+	}
+	if store.key("rekeyed") != keyB {
+		t.Fatal("a refused file changed the running set")
+	}
+
+	// {} is how the last tenant is revoked
+	if err := os.WriteFile(store.path, []byte("{}"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store.apply(reg, t.Logf)
+	if reg.lookup("keep") != nil || store.has("keep") {
+		t.Fatal("the last tenant survived an empty tenants file")
 	}
 }
 
@@ -479,13 +452,13 @@ func TestHealthEndpoint(t *testing.T) {
 
 // startFakePrivateGateway mimics a private gateway: auth, yamux, PROXY
 // v2 header, TLS termination, then a canned HTTP response.
-func startFakePrivateGateway(t *testing.T, controlAddr string, cert tls.Certificate, hdr chan<- string) {
+func startFakePrivateGateway(t *testing.T, controlAddr string, client, cert tls.Certificate, hdr chan<- string) {
 	t.Helper()
-	conn, err := tls.Dial("tcp", controlAddr, &tls.Config{InsecureSkipVerify: true})
+	conn, err := tls.Dial("tcp", controlAddr, &tls.Config{InsecureSkipVerify: true, Certificates: []tls.Certificate{client}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := conn.Write([]byte(`{"tenant":"tenant1","token":"sekrit"}` + "\n")); err != nil {
+	if _, err := conn.Write([]byte(`{"v":1}` + "\n")); err != nil {
 		t.Fatal(err)
 	}
 	br := bufio.NewReader(conn)
@@ -613,43 +586,6 @@ func TestTenantValidation(t *testing.T) {
 	}
 }
 
-func TestControlMTLS_DNSNames(t *testing.T) {
-	cert := testClientCertSAN(t, "tenant-san")
-	pool := x509.NewCertPool()
-	pool.AddCert(cert.Leaf)
-
-	reg := newRegistry(limits{})
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
-		MinVersion:   tls.VersionTLS12,
-		ClientCAs:    pool,
-		ClientAuth:   tls.RequireAndVerifyClientCert,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlLn.Close()
-	store := testTenantStore(t, map[string]string{"tenant-san": ""})
-	go runControl(controlLn, store, reg, testAuthLimiter(), authMTLS)
-
-	conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{
-		InsecureSkipVerify: true,
-		Certificates:       []tls.Certificate{cert},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-	fmt.Fprintf(conn, `{"tenant":"tenant-san","token":""}`+"\n")
-	line, err := bufio.NewReader(conn).ReadString('\n')
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(line, `"ok":true`) {
-		t.Fatalf("mTLS with SAN DNS name failed: %q", line)
-	}
-}
-
 func TestRedirectHardening(t *testing.T) {
 	srv := httptest.NewServer(redirectHandler("citadelle-tls.fr"))
 	defer srv.Close()
@@ -723,16 +659,9 @@ func TestPipeOneWayTransferOutlivesIdleTimeout(t *testing.T) {
 // that is not ours gets no answer at all.
 func TestRefusalIsATLSAlert(t *testing.T) {
 	const domain = "gw.test"
-	tenants := testTenantStore(t, map[string]string{"tenant1": "sekrit"})
 	reg := newRegistry(limits{MaxStreams: 1})
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlLn.Close()
-	go runControl(controlLn, tenants, reg, testAuthLimiter(), authToken)
+	clientCert := testClientCert(t, "tenant1")
+	controlLn, tenants := startControl(t, reg, testAuthLimiter(), clientCert)
 	proxyLn, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatal(err)
@@ -779,7 +708,7 @@ func TestRefusalIsATLSAlert(t *testing.T) {
 		t.Fatalf("a name that is not ours got an answer: %v", err)
 	}
 
-	startFakePrivateGateway(t, controlLn.Addr().String(), testCert(t, "tenant1.gw.test"), make(chan string, 1))
+	startFakePrivateGateway(t, controlLn.Addr().String(), clientCert, testCert(t, "tenant1.gw.test"), make(chan string, 1))
 	waitForTunnel(t, reg, "tenant1")
 	reg.acquireStream("tenant1")
 	if got := alertOf(handshake("tenant1.gw.test")); got != alertTunnelBusy {
@@ -791,23 +720,11 @@ func TestRefusalIsATLSAlert(t *testing.T) {
 // cap; a private gateway that announces no version is served as before.
 func TestControlReplyVersionAndLimits(t *testing.T) {
 	reg := newRegistry(limits{MaxStreams: 128})
-	controlLn, err := tls.Listen("tcp", "127.0.0.1:0", &tls.Config{
-		Certificates: []tls.Certificate{testCert(t, "control.gw.test")},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer controlLn.Close()
-	go runControl(controlLn, testTenantStore(t, map[string]string{"tenant1": "sekrit"}), reg, testAuthLimiter(), authToken)
+	clientCert := testClientCert(t, "tenant1")
+	controlLn, _ := startControl(t, reg, testAuthLimiter(), clientCert)
 
-	for announced, retained := range map[string]int{``: 0, `"v":1,`: 1, `"v":7,`: protocolVersion} {
-		conn, err := tls.Dial("tcp", controlLn.Addr().String(), &tls.Config{InsecureSkipVerify: true})
-		if err != nil {
-			t.Fatal(err)
-		}
-		fmt.Fprintf(conn, `{%s"tenant":"tenant1","token":"sekrit"}`+"\n", announced)
-		line, err := bufio.NewReader(conn).ReadString('\n')
-		conn.Close()
+	for announced, retained := range map[string]int{`{}`: 0, `{"v":1}`: 1, `{"v":7}`: protocolVersion} {
+		line, err := controlAuth(t, controlLn, announced, clientCert)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -872,7 +789,7 @@ func TestTurnRelayRoutedBySNI(t *testing.T) {
 	}
 	defer proxyLn.Close()
 	turn := turnRelay{host: "turn.gw.test", addr: relayLn.Addr().String()}
-	go runProxy(proxyLn, domain, newRegistry(limits{}), testTenantStore(t, map[string]string{"turn": "sekrit"}), turn)
+	go runProxy(proxyLn, domain, newRegistry(limits{}), testTenantStore(t, map[string]string{"turn": testKey}), turn)
 
 	conn, err := tls.Dial("tcp", proxyLn.Addr().String(),
 		&tls.Config{ServerName: "TURN.gw.test", InsecureSkipVerify: true})

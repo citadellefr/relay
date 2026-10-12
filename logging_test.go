@@ -41,7 +41,7 @@ func TestLogAddrFull(t *testing.T) {
 }
 
 func TestKnownTenant(t *testing.T) {
-	tenants := testTenantStore(t, map[string]string{"tenant1": "a", "partage-legitime": "b"})
+	tenants := testTenantStore(t, map[string]string{"tenant1": testKey, "partage-legitime": testKey})
 	cases := []struct {
 		label string
 		want  bool
@@ -65,7 +65,7 @@ func TestKnownTenant(t *testing.T) {
 // internet chooses what our journal contains.
 func TestProxyJournalHasNoClientAddress(t *testing.T) {
 	const domain = "gw.test"
-	tenants := testTenantStore(t, map[string]string{"tenant1": "sekrit"})
+	tenants := testTenantStore(t, map[string]string{"tenant1": testKey})
 
 	var buf syncBuffer
 	log.SetOutput(&buf)

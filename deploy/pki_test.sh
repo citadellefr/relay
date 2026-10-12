@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Checks the control-plane PKI end to end: a CA, a certificate a gateway could
-# use, and the refusals that keep the CN trustworthy — because that CN is the
-# only thing the gateway checks (control.go).
+# use for the key of its customer sheet, and the refusals that keep the CN
+# trustworthy — the CN and the key id are what the gateway checks (control.go).
 #
 #   ./pki_test.sh
 set -uo pipefail
@@ -24,8 +24,31 @@ fail() {
 # a second CA would sign certificates the deployed gateway rejects
 ./pki.sh init > /dev/null 2>&1 && fail "a second init overwrote the CA"
 
-./pki.sh issue tenant1 > /dev/null || fail "issue"
-[ "$(stat -c %a "$PKI_DIR/tenant1.key")" = "600" ] || fail "the client key is world readable"
+sheet=$(./pki.sh issue tenant1) || fail "issue"
+
+# the sheet is the only place the key exists: 13 groups of 4 base32 characters
+key=$(grep -xE ' +([A-Z2-7]{4} ){12}[A-Z2-7]{4}' <<< "$sheet" | tr -d ' ')
+[ ${#key} -eq 52 ] || fail "no key on the customer sheet"
+[ "$(ls "$PKI_DIR" | tr '\n' ' ')" = "ca.crt ca.key ca.srl tenant1.crt " ] ||
+	fail "more than a certificate was written: $(ls "$PKI_DIR")"
+grep -rqF "$key" "$PKI_DIR" && fail "the key was written to disk"
+
+# the key and the certificate are one pair: rebuild the private key the way
+# the server does and compare what it gives with what was signed
+pub=$({
+	printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20'
+	printf '%s====' "$key" | base32 -d
+} | openssl pkey -inform DER -pubout)
+[ "$pub" = "$(openssl x509 -in "$PKI_DIR/tenant1.crt" -noout -pubkey)" ] ||
+	fail "the certificate was not signed for the key of the sheet"
+
+# the id of the sheet is the one tenants.json holds, and show finds it again
+id=$(openssl pkey -pubin -outform DER <<< "$pub" | tail -c 32 | sha256sum | cut -d ' ' -f 1)
+grep -qF "$id" <<< "$sheet" || fail "the sheet does not print the key id"
+./pki.sh show tenant1 | grep -qxF "id=$id" || fail "show prints another key id"
+
+# two tenants never share a key
+./pki.sh issue tenant2 | grep -qF "$id" && fail "two tenants got the same key"
 
 # the CN is what control.go compares the announced tenant to
 subject=$(openssl x509 -in "$PKI_DIR/tenant1.crt" -noout -subject -nameopt RFC2253)
@@ -43,7 +66,7 @@ openssl verify -CAfile "$PKI_DIR/ca.crt" "$work/other.crt" > /dev/null 2>&1 &&
 
 # the CN is an identity, not free text
 for bad in "Tenant1" "a/b" "../evil" "" "-x"; do
-	./pki.sh issue "$bad" > /dev/null 2>&1 && fail "issued a certificate for %s" "$bad"
+	./pki.sh issue "$bad" > /dev/null 2>&1 && fail "issued a certificate for $bad"
 done
 
 # a live gateway is using the current one: overwriting it would cut its tunnel
@@ -51,4 +74,4 @@ done
 
 ./pki.sh show tenant1 > /dev/null || fail "show"
 
-echo "ok — CA, issuance, client purpose, CN shape and no silent overwrite"
+echo "ok — CA, key drawn and never stored, pair and id, client purpose, CN shape and no silent overwrite"

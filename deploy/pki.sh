@@ -1,18 +1,24 @@
 #!/usr/bin/env bash
 # Client PKI of the control plane: one CA, one certificate per tenant,
-# whose CN is the tenant id its private gateway announces on :7000.
+# whose CN is the tenant id its private gateway is known by on :7000.
 #
 #   pki.sh init                CA key and certificate, once
-#   pki.sh issue <tenant>      key and certificate for one private gateway
-#   pki.sh show <tenant>       who it is for, until when, still signed by us
+#   pki.sh issue <tenant>      draws the tenant's key, signs its certificate,
+#                              prints the customer sheet
+#   pki.sh show <tenant>       who it is for, which key, until when
 #
 # Runs on the admin machine, not on the VPS: only ca.crt is deployed there
 # (CONTROL_CLIENT_CA), never ca.key. Taking the VPS must not give the power to
 # mint gateways.
 #
-# Revocation stays in tenants.json: dropping a tenant and reloading (SIGHUP)
-# closes its tunnel at once. A CRL would have to be distributed to exactly one
-# machine, which is what tenants.json already is.
+# The tenant's key is a 32-byte seed its server turns into an Ed25519 pair.
+# The certificate is signed here, in advance, for that pair; the seed itself is
+# printed once on the customer sheet and written nowhere, not even here.
+#
+# Revocation stays in tenants.json, which binds each tenant to the id of its
+# key: dropping the tenant, or binding it to another key, closes its tunnel at
+# the next reload. A CRL would have to be distributed to exactly one machine,
+# which is what tenants.json already is.
 set -euo pipefail
 umask 077
 
@@ -40,6 +46,13 @@ init() {
 	echo "deploy that file as CONTROL_CLIENT_CA; ca.key never leaves this machine"
 }
 
+# key_id reads a PEM public key: hex(SHA-256) of the 32 raw bytes an Ed25519
+# key ends with — what tenants.json holds, and what a server asks its
+# certificate by.
+key_id() {
+	openssl pkey -pubin -outform DER | tail -c 32 | sha256sum | cut -d ' ' -f 1
+}
+
 issue() {
 	tenant=$1
 	[ -r "$PKI_DIR/ca.key" ] || fail "no CA in $PKI_DIR — run '$0 init' first"
@@ -60,21 +73,47 @@ extendedKeyUsage=clientAuth
 subjectKeyIdentifier=hash
 authorityKeyIdentifier=keyid
 EOF
-	openssl req -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
-		-subj "/CN=$tenant" -keyout "$PKI_DIR/$tenant.key" -out "$tmp/csr" 2> /dev/null
-	openssl x509 -req -in "$tmp/csr" -CA "$PKI_DIR/ca.crt" -CAkey "$PKI_DIR/ca.key" \
-		-CAcreateserial -days "$CERT_DAYS" -extfile "$tmp/ext" \
-		-out "$PKI_DIR/$tenant.crt" 2> /dev/null
-	chmod 600 "$PKI_DIR/$tenant.key"
-	echo "$PKI_DIR/$tenant.crt"
-	echo "$PKI_DIR/$tenant.key"
-	echo "on the client server: GATEWAY_CLIENT_CERT and GATEWAY_CLIENT_KEY"
+	# the seed lives in this variable and in pipes only: 32 bytes as 52
+	# base32 characters, what the customer types
+	seed=$(openssl rand 32 | base32 | tr -d '=')
+	[ ${#seed} -eq 52 ] || fail "could not draw a seed"
+	# an Ed25519 private key in DER is this fixed header followed by the seed
+	{
+		printf '\x30\x2e\x02\x01\x00\x30\x05\x06\x03\x2b\x65\x70\x04\x22\x04\x20'
+		printf '%s====' "$seed" | base32 -d
+	} | openssl pkey -inform DER -pubout -out "$tmp/pub" ||
+		fail "could not derive the key pair"
+	# signed from the public key alone: no request, so no private key at rest
+	openssl x509 -new -subj "/CN=$tenant" -force_pubkey "$tmp/pub" \
+		-CA "$PKI_DIR/ca.crt" -CAkey "$PKI_DIR/ca.key" -CAcreateserial \
+		-days "$CERT_DAYS" -extfile "$tmp/ext" -out "$tmp/crt" ||
+		fail "could not sign the certificate of $tenant"
+	id=$(key_id < "$tmp/pub")
+	mv "$tmp/crt" "$PKI_DIR/$tenant.crt"
+
+	cat << EOF
+Fiche client — $tenant
+
+  Clé de raccordement, à recopier dans l'application pour raccorder le serveur :
+
+    $(fold -w 4 <<< "$seed" | paste -sd ' ')
+
+  Cette clé n'est affichée qu'une fois et n'est enregistrée nulle part.
+  Qui la détient peut raccorder un serveur sous ce nom : à remettre au
+  client seul, par un canal sûr.
+
+Pour Citadelle
+  Certificat             : $PKI_DIR/$tenant.crt
+  Identifiant de retrait : $id
+  Valable jusqu'au       : $(openssl x509 -in "$PKI_DIR/$tenant.crt" -noout -enddate | cut -d = -f 2)
+EOF
 }
 
 show() {
 	crt=$PKI_DIR/$1.crt
 	[ -r "$crt" ] || crt=$1
 	openssl x509 -in "$crt" -noout -subject -issuer -dates
+	echo "id=$(openssl x509 -in "$crt" -noout -pubkey | key_id)"
 	openssl verify -CAfile "$PKI_DIR/ca.crt" -purpose sslclient "$crt"
 }
 

@@ -67,8 +67,8 @@ func TestTenantFromSNI(t *testing.T) {
 // is the browser origin, not the route.
 func TestResolveTenantSharePrefix(t *testing.T) {
 	reg := newRegistry(limits{})
-	reg.register("tenant1", &yamux.Session{}, "token")
-	reg.register("partage-legitime", &yamux.Session{}, "token")
+	reg.register("tenant1", &yamux.Session{}, testKey)
+	reg.register("partage-legitime", &yamux.Session{}, testKey)
 
 	cases := []struct {
 		sni, tenant string
