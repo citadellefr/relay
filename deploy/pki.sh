@@ -3,8 +3,9 @@
 # whose CN is the tenant id its private gateway is known by on :7000.
 #
 #   pki.sh init                CA key and certificate, once
-#   pki.sh issue <tenant>      draws the tenant's key, signs its certificate,
-#                              prints the customer sheet
+#   pki.sh issue [tenant]      draws the tenant's key, signs its certificate,
+#                              prints the customer sheet; without a name, one
+#                              is drawn too
 #   pki.sh show <tenant>       who it is for, which key, until when
 #
 # Runs on the admin machine, not on the VPS: only ca.crt is deployed there
@@ -54,7 +55,8 @@ key_id() {
 }
 
 issue() {
-	tenant=$1
+	# a drawn name says nothing about the customer it is for
+	tenant=${1-$(openssl rand -hex 8)}
 	[ -r "$PKI_DIR/ca.key" ] || fail "no CA in $PKI_DIR — run '$0 init' first"
 	# the CN is the identity the gateway is judged on, so keep it to the shape
 	# tenant ids actually have
@@ -120,15 +122,15 @@ show() {
 case "${1:-}" in
 init) init ;;
 issue)
-	[ $# -eq 2 ] || fail "usage: $0 issue <tenant>"
-	issue "$2"
+	[ $# -le 2 ] || fail "usage: $0 issue [tenant]"
+	issue "${@:2}"
 	;;
 show)
 	[ $# -eq 2 ] || fail "usage: $0 show <tenant>"
 	show "$2"
 	;;
 *)
-	echo "usage: $0 {init|issue <tenant>|show <tenant>}" >&2
+	echo "usage: $0 {init|issue [tenant]|show <tenant>}" >&2
 	exit 2
 	;;
 esac

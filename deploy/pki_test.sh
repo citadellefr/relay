@@ -47,6 +47,12 @@ id=$(openssl pkey -pubin -outform DER <<< "$pub" | tail -c 32 | sha256sum | cut 
 grep -qF "$id" <<< "$sheet" || fail "the sheet does not print the key id"
 ./pki.sh show tenant1 | grep -qxF "id=$id" || fail "show prints another key id"
 
+# without a name one is drawn, of the shape the gateway accepts
+drawn=$(./pki.sh issue | sed -n 's/^Fiche client — //p')
+[[ $drawn =~ ^[a-z0-9]{16}$ ]] || fail "drawn tenant name: $drawn"
+[ -r "$PKI_DIR/$drawn.crt" ] || fail "no certificate for the drawn tenant"
+rm "$PKI_DIR/$drawn.crt"
+
 # two tenants never share a key
 ./pki.sh issue tenant2 | grep -qF "$id" && fail "two tenants got the same key"
 
