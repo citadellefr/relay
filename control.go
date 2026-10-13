@@ -8,8 +8,10 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"log"
 	"net"
+	"sync"
 	"time"
 
 	"github.com/hashicorp/yamux"
@@ -94,7 +96,8 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 
 	// the private gateway only starts yamux after reading the reply, but be
 	// safe with anything the bufio reader may already hold
-	sess, err := yamux.Server(&bufferedConn{Conn: conn, r: br}, yamuxConfig())
+	bc := &bufferedConn{Conn: conn, r: br}
+	sess, err := yamux.Server(bc, yamuxConfig())
 	if err != nil {
 		conn.Close()
 		return
@@ -106,9 +109,54 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 		sess.Close()
 	}
 	log.Printf("control: tenant %q connected from %s", tenant, conn.RemoteAddr())
+	go measureRTT(sess, func(rtt time.Duration) { reg.setRTT(tenant, sess, rtt) })
 	<-sess.CloseChan()
-	reg.unregister(tenant, sess)
-	log.Printf("control: tenant %q disconnected", tenant)
+	cause := dropCause(bc.err())
+	reg.unregister(tenant, sess, cause)
+	log.Printf("control: tenant %q disconnected (%s)", tenant, cause)
+}
+
+// How often a live session is pinged, for /healthz only: a slow answer is a
+// busy link, not a dead one, and closes nothing. A variable for the tests.
+var rttInterval = time.Minute
+
+// How long a frame may wait to be sent, and a ping to be answered.
+const writeTimeout = 15 * time.Second
+
+func measureRTT(sess *yamux.Session, record func(time.Duration)) {
+	t := time.NewTicker(rttInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-sess.CloseChan():
+			return
+		case <-t.C:
+		}
+		rtt, err := sess.Ping()
+		if errors.Is(err, yamux.ErrTimeout) {
+			// no answer in writeTimeout: say at least that much
+			rtt = writeTimeout
+		} else if err != nil {
+			continue
+		}
+		record(rtt)
+	}
+}
+
+// dropCause names why a tunnel ended without the peer's address, which the
+// connect line already gave: a closed connection is ours (replaced, revoked),
+// EOF the peer's, a timeout the kernel's verdict on a silent peer.
+func dropCause(err error) string {
+	var op *net.OpError
+	switch {
+	case err == nil:
+		return "closed"
+	case errors.Is(err, net.ErrClosed):
+		return "closed here"
+	case errors.As(err, &op):
+		return op.Err.Error()
+	}
+	return err.Error()
 }
 
 // authenticate returns the tenant the certificate names and the id of its
@@ -163,7 +211,7 @@ func yamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
 	cfg.EnableKeepAlive = false
 	cfg.StreamOpenTimeout = 0
-	cfg.ConnectionWriteTimeout = 15 * time.Second
+	cfg.ConnectionWriteTimeout = writeTimeout
 	// the receiver's window bounds the sender: 256 KiB held downloads to about
 	// 5 MB/s at 50 ms. Worst case in memory is streams × window per tenant,
 	// which TENANT_MAX_STREAMS bounds.
@@ -171,10 +219,29 @@ func yamuxConfig() *yamux.Config {
 	return cfg
 }
 
-// bufferedConn replays bytes already sitting in the bufio reader.
+// bufferedConn replays bytes already sitting in the bufio reader, and keeps
+// the first read error: the session ends on it.
 type bufferedConn struct {
 	net.Conn
-	r *bufio.Reader
+	r       *bufio.Reader
+	mu      sync.Mutex
+	readErr error
 }
 
-func (c *bufferedConn) Read(p []byte) (int, error) { return c.r.Read(p) }
+func (c *bufferedConn) Read(p []byte) (int, error) {
+	n, err := c.r.Read(p)
+	if err != nil {
+		c.mu.Lock()
+		if c.readErr == nil {
+			c.readErr = err
+		}
+		c.mu.Unlock()
+	}
+	return n, err
+}
+
+func (c *bufferedConn) err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.readErr
+}

@@ -23,6 +23,9 @@ type tenantState struct {
 	totalStreams  uint64
 	key           string        // key id the live session authenticated with
 	bandwidth     *rate.Limiter // nil when unlimited
+	refused       uint64        // connections turned away at the stream cap
+	rtt           time.Duration // last ping of the live session, 0 = not yet
+	lastDrop      string        // why the previous session ended
 }
 
 // registry maps a tenant id to its live tunnel session and usage counters.
@@ -66,11 +69,25 @@ func (r *registry) register(tenant string, s *yamux.Session, key string) {
 	}
 }
 
-// unregister removes the session only if it is still the current one.
-func (r *registry) unregister(tenant string, s *yamux.Session) {
+// unregister removes the session only if it is still the current one, and
+// keeps why it ended.
+func (r *registry) unregister(tenant string, s *yamux.Session, cause string) {
+	r.mu.Lock()
+	if st := r.tenants[tenant]; st != nil {
+		st.lastDrop = cause
+		if st.sess == s {
+			st.sess = nil
+			st.rtt = 0
+		}
+	}
+	r.mu.Unlock()
+}
+
+// setRTT records a ping of the tenant's live session.
+func (r *registry) setRTT(tenant string, s *yamux.Session, rtt time.Duration) {
 	r.mu.Lock()
 	if st := r.tenants[tenant]; st != nil && st.sess == s {
-		st.sess = nil
+		st.rtt = rtt
 	}
 	r.mu.Unlock()
 }
@@ -90,6 +107,7 @@ func (r *registry) acquireStream(tenant string) bool {
 	defer r.mu.Unlock()
 	st := r.state(tenant)
 	if r.lim.MaxStreams > 0 && st.activeStreams >= r.lim.MaxStreams {
+		st.refused++
 		return false
 	}
 	st.activeStreams++
@@ -142,6 +160,9 @@ type tenantStats struct {
 	Connects      uint64    `json:"connects"`
 	ActiveStreams int       `json:"activeStreams"`
 	TotalStreams  uint64    `json:"totalStreams"`
+	Refused       uint64    `json:"refused"`
+	RTTMs         int64     `json:"rttMs,omitempty"`
+	LastDrop      string    `json:"lastDrop,omitempty"`
 }
 
 func (r *registry) snapshot() map[string]tenantStats {
@@ -154,9 +175,15 @@ func (r *registry) snapshot() map[string]tenantStats {
 			Connects:      st.connects,
 			ActiveStreams: st.activeStreams,
 			TotalStreams:  st.totalStreams,
+			Refused:       st.refused,
+			LastDrop:      st.lastDrop,
 		}
 		if st.sess != nil {
 			s.ConnectedAt = st.connectedAt
+		}
+		if st.rtt > 0 {
+			// under a millisecond still reads as measured
+			s.RTTMs = max(st.rtt.Milliseconds(), 1)
 		}
 		out[id] = s
 	}

@@ -416,6 +416,9 @@ func TestStreamCap(t *testing.T) {
 	if reg.acquireStream("t") {
 		t.Fatal("stream over the cap accepted")
 	}
+	if n := reg.snapshot()["t"].Refused; n != 1 {
+		t.Fatalf("refused = %d, want 1", n)
+	}
 	reg.releaseStream("t")
 	if !reg.acquireStream("t") {
 		t.Fatal("released slot not reusable")

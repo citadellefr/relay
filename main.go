@@ -49,7 +49,7 @@ func main() {
 	}
 
 	reg := newRegistry(limits{
-		MaxStreams:  envInt("TENANT_MAX_STREAMS", 128),
+		MaxStreams:  envInt("TENANT_MAX_STREAMS", 1024),
 		MaxBytesSec: envInt("TENANT_MAX_MBPS", 0) * 1_000_000 / 8,
 	})
 	tenants.reloadOnSIGHUP(reg, log.Printf)

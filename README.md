@@ -27,10 +27,10 @@ TLS is terminated exclusively on the tenant's private gateway—never on the pub
                         +---------------------------------------------+
 ```
 
-1. **Control Plane (`:7000`)**: Tenant instances connect over TLS and authenticate with an X.509 client certificate (mTLS, mandatory): the tenant is the certificate's CommonName, and `tenants.json` must bind that tenant to the certificate's key. The handshake is one JSON line each way — `{"v":1}` answered by `{"ok":true,"v":1,"maxStreams":128}`: the protocol version retained (the lower of the two) and the tenant's stream cap. A refusal never says why. Once authenticated, the connection is upgraded to a yamux multiplexed session.
+1. **Control Plane (`:7000`)**: Tenant instances connect over TLS and authenticate with an X.509 client certificate (mTLS, mandatory): the tenant is the certificate's CommonName, and `tenants.json` must bind that tenant to the certificate's key. The handshake is one JSON line each way — `{"v":1}` answered by `{"ok":true,"v":1,"maxStreams":1024}`: the protocol version retained (the lower of the two) and the tenant's stream cap. A refusal never says why. Once authenticated, the connection is upgraded to a yamux multiplexed session.
 2. **SNI Data Proxy (`:443`)**: Accepts raw TLS connections, extracts the hostname from the `ClientHello` (`<tenant>.<domain>` or `partage-<tenant>.<domain>`), injects a PROXY protocol v2 header (to pass along client IP information), and pipes the stream directly into the tenant's tunnel. A refusal is told as a plaintext TLS alert, never as a response: `unrecognized_name` when no tunnel serves the name, `internal_error` when the tunnel has no stream left.
 3. **HTTP Redirect (`:80`)**: Automatically redirects plain HTTP requests to HTTPS.
-4. **Health & Supervision (`:7001/healthz`)**: Local JSON endpoint exposing active tunnel states, stream counters, and authentication methods.
+4. **Health & Supervision (`:7001/healthz`)**: Local JSON endpoint exposing active tunnel states, stream counters, connections refused at the stream cap, the round trip of the last tunnel ping (measured every minute, it closes nothing) and why the last tunnel ended.
 
 ---
 
@@ -50,7 +50,7 @@ Configuration is provided through environment variables:
 | `HEALTH_ADDR` | Listen address for local health metrics (`""` to disable). | `127.0.0.1:7001` |
 | `CONTROL_CLIENT_CA`| Path to the CA that signs the tenants' client certificates. **(Required)** | — |
 | `CONTROL_MTLS` | Legacy: empty or `require`. Any other value asked for token access, which no longer exists, and prevents startup. | `""` |
-| `TENANT_MAX_STREAMS`| Max concurrent proxied streams per tenant (`0` for unlimited). Worst-case memory is streams × the 2 MiB yamux window. | `128` |
+| `TENANT_MAX_STREAMS`| Max concurrent proxied streams per tenant (`0` for unlimited). Worst-case memory is streams × the 2 MiB yamux window. | `1024` |
 | `TENANT_MAX_MBPS` | Shared bandwidth limit per tenant in Mbps (`0` for unlimited). | `0` |
 | `TURN_HOST` | The one name on the proxy port that is not a tenant's: a TURN relay reached over TLS, routed verbatim to `TURN_TLS_ADDR`. Empty routes nothing. | — |
 | `TURN_TLS_ADDR` | `host:port` where that relay terminates its own TLS. Set together with `TURN_HOST`. | — |
