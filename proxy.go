@@ -131,7 +131,7 @@ func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tena
 	if _, err := stream.Write(append(proxyHeader(conn), peeked...)); err != nil {
 		return
 	}
-	pipe(conn, stream, reg.bandwidth(tenant))
+	pipe(conn, framedStream{stream}, reg.bandwidth(tenant))
 }
 
 // tenantFromSNI accepts exactly one label before the base domain.
