@@ -46,7 +46,7 @@ func TestDropCause(t *testing.T) {
 		err  error
 		want string
 	}{
-		{nil, "closed"},
+		{nil, "closed here"},
 		{io.EOF, "EOF"},
 		{fmt.Errorf("read: %w", net.ErrClosed), "closed here"},
 		{&net.OpError{Op: "read", Net: "tcp", Addr: &net.TCPAddr{IP: net.IPv4(203, 0, 113, 7), Port: 4242},

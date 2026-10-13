@@ -144,14 +144,13 @@ func measureRTT(sess *yamux.Session, record func(time.Duration)) {
 }
 
 // dropCause names why a tunnel ended without the peer's address, which the
-// connect line already gave: a closed connection is ours (replaced, revoked),
-// EOF the peer's, a timeout the kernel's verdict on a silent peer.
+// connect line already gave: no error, or a closed connection, means we closed
+// it (replaced, revoked); EOF is the peer's doing, a timeout the kernel's
+// verdict on a silent peer.
 func dropCause(err error) string {
 	var op *net.OpError
 	switch {
-	case err == nil:
-		return "closed"
-	case errors.Is(err, net.ErrClosed):
+	case err == nil, errors.Is(err, net.ErrClosed):
 		return "closed here"
 	case errors.As(err, &op):
 		return op.Err.Error()
@@ -220,28 +219,39 @@ func yamuxConfig() *yamux.Config {
 }
 
 // bufferedConn replays bytes already sitting in the bufio reader, and keeps
-// the first read error: the session ends on it.
+// the first error of the connection: the session ends on it.
 type bufferedConn struct {
 	net.Conn
-	r       *bufio.Reader
-	mu      sync.Mutex
-	readErr error
+	r        *bufio.Reader
+	mu       sync.Mutex
+	firstErr error
 }
 
 func (c *bufferedConn) Read(p []byte) (int, error) {
 	n, err := c.r.Read(p)
-	if err != nil {
-		c.mu.Lock()
-		if c.readErr == nil {
-			c.readErr = err
-		}
-		c.mu.Unlock()
-	}
+	c.keep(err)
 	return n, err
+}
+
+func (c *bufferedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	c.keep(err)
+	return n, err
+}
+
+func (c *bufferedConn) keep(err error) {
+	if err == nil {
+		return
+	}
+	c.mu.Lock()
+	if c.firstErr == nil {
+		c.firstErr = err
+	}
+	c.mu.Unlock()
 }
 
 func (c *bufferedConn) err() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return c.readErr
+	return c.firstErr
 }
