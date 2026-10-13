@@ -9,16 +9,19 @@ import (
 // TCP_NOTSENT_LOWAT, which package syscall does not name.
 const tcpNotSentLowat = 25
 
-// How much the kernel may hold of the tunnel that it has not sent yet.
+// How much the kernel may hold of a socket that it has not sent yet.
 const tunnelUnsent = 32 * 1024
 
-// boundSendQueue keeps the tunnel's socket from queueing megabytes ahead of
-// the link. Every stream shares this one connection: with the kernel's default
-// a transfer filling a slow uplink put seconds of its own data in front of
-// everything else — a call's signalling answered late, and yamux's keepalive
-// not at all, which closed the tunnel under everyone.
-func boundSendQueue(conn *tls.Conn) {
-	tcp, ok := conn.NetConn().(*net.TCPConn)
+// boundSendQueue keeps a socket from queueing megabytes ahead of the link. The
+// tunnel's carries every stream: with the kernel's default a transfer filling a
+// slow uplink put seconds of its own data in front of everything else, a
+// call's signalling among it. A TURN socket carries media, where what waits
+// unsent is late audio.
+func boundSendQueue(conn net.Conn) {
+	if tc, ok := conn.(*tls.Conn); ok {
+		conn = tc.NetConn()
+	}
+	tcp, ok := conn.(*net.TCPConn)
 	if !ok {
 		return
 	}

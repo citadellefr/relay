@@ -64,3 +64,35 @@ func TestYamuxDoesNotJudgeLiveness(t *testing.T) {
 		t.Fatalf("keepalive %v, stream open timeout %v: liveness belongs to watchPeer", cfg.EnableKeepAlive, cfg.StreamOpenTimeout)
 	}
 }
+
+// A TURN socket relayed over TLS carries media: what the kernel holds unsent
+// is late audio.
+func TestBoundSendQueueOnPlainSockets(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	go func() {
+		if c, err := ln.Accept(); err == nil {
+			defer c.Close()
+			c.Read(make([]byte, 1))
+		}
+	}()
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	boundSendQueue(conn)
+	sc, err := conn.(*net.TCPConn).SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var got int
+	var gerr error
+	sc.Control(func(fd uintptr) { got, gerr = syscall.GetsockoptInt(int(fd), syscall.IPPROTO_TCP, tcpNotSentLowat) })
+	if gerr != nil || got != tunnelUnsent {
+		t.Fatalf("TCP_NOTSENT_LOWAT = %d, %v; want %d", got, gerr, tunnelUnsent)
+	}
+}

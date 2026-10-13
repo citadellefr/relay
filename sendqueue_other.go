@@ -2,7 +2,7 @@
 
 package main
 
-import "crypto/tls"
+import "net"
 
 // The gateway runs on Linux; elsewhere the kernel's default stands.
-func boundSendQueue(*tls.Conn) {}
+func boundSendQueue(net.Conn) {}

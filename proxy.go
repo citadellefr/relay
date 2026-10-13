@@ -45,6 +45,8 @@ func (t turnRelay) serve(conn net.Conn, peeked []byte) {
 		return
 	}
 	defer relay.Close()
+	boundSendQueue(conn)
+	boundSendQueue(relay)
 	if _, err := relay.Write(peeked); err != nil {
 		return
 	}
