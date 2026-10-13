@@ -89,6 +89,7 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 	conn.SetDeadline(time.Time{})
 	if tc, ok := conn.(*tls.Conn); ok {
 		boundSendQueue(tc)
+		watchPeer(tc)
 	}
 
 	// the private gateway only starts yamux after reading the reply, but be
@@ -155,14 +156,14 @@ func writeReply(conn net.Conn, r authReply) error {
 	return err
 }
 
-// yamux keepalive doubles as the tunnel heartbeat: a dead session closes
-// itself and the registry entry is cleaned up.
+// The tunnel's liveness is the kernel's (watchPeer), not yamux's: its ping and
+// its stream-open timer both wait behind the frames already queued, and closed
+// sessions that were only busy.
 func yamuxConfig() *yamux.Config {
 	cfg := yamux.DefaultConfig()
-	cfg.KeepAliveInterval = 30 * time.Second
+	cfg.EnableKeepAlive = false
+	cfg.StreamOpenTimeout = 0
 	cfg.ConnectionWriteTimeout = 15 * time.Second
-	// don't let Open block on a frozen tunnel the keepalive hasn't caught yet
-	cfg.StreamOpenTimeout = 15 * time.Second
 	// the receiver's window bounds the sender: 256 KiB held downloads to about
 	// 5 MB/s at 50 ms. Worst case in memory is streams × window per tenant,
 	// which TENANT_MAX_STREAMS bounds.
