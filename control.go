@@ -75,11 +75,13 @@ func handleControl(conn net.Conn, tenants *tenantStore, reg *registry, authLim *
 	}
 	tenant, key := authenticate(conn, tenants)
 	if key == "" {
-		writeReply(conn, authReply{Error: "auth failed"})
+		// counted before the refusal is told: the next attempt, made on reading
+		// it, must find this one already there
+		authLim.fail(conn.RemoteAddr())
 		// full address on purpose: this is the security journal of the control
 		// plane, and host-level banning reads these lines
 		log.Printf("control: auth failed for %q from %s", tenant, conn.RemoteAddr())
-		authLim.fail(conn.RemoteAddr())
+		writeReply(conn, authReply{Error: "auth failed"})
 		conn.Close()
 		return
 	}
