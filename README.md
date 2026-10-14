@@ -50,7 +50,8 @@ Configuration is provided through environment variables:
 | `HEALTH_ADDR` | Listen address for local health metrics (`""` to disable). | `127.0.0.1:7001` |
 | `CONTROL_CLIENT_CA`| Path to the CA that signs the tenants' client certificates. **(Required)** | — |
 | `CONTROL_MTLS` | Legacy: empty or `require`. Any other value asked for token access, which no longer exists, and prevents startup. | `""` |
-| `TENANT_MAX_STREAMS`| Max concurrent proxied streams per tenant (`0` for unlimited). Worst-case memory is streams × the 2 MiB yamux window. | `1024` |
+| `TENANT_MAX_STREAMS`| Max concurrent proxied streams per tenant (`0` for unlimited). Worst-case memory is about streams × 1.4 MiB (1 MiB yamux window, measured). | `1024` |
+| `MAX_STREAMS_PER_ADDRESS`| Max concurrent proxied streams per client address (IPv4, or IPv6 /64), all tenants together (`0` for unlimited): one address cannot take a tenant's whole cap, and what it can pin in memory stays bounded (about 180 MiB). | `128` |
 | `TENANT_MAX_MBPS` | Shared bandwidth limit per tenant in Mbps (`0` for unlimited). | `0` |
 | `TURN_HOST` | The one name on the proxy port that is not a tenant's: a TURN relay reached over TLS, routed verbatim to `TURN_TLS_ADDR`. Empty routes nothing. | — |
 | `TURN_TLS_ADDR` | `host:port` where that relay terminates its own TLS. Set together with `TURN_HOST`. | — |

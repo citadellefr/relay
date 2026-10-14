@@ -410,24 +410,54 @@ func TestTenantReloadRevokes(t *testing.T) {
 
 func TestStreamCap(t *testing.T) {
 	reg := newRegistry(limits{MaxStreams: 2})
-	if !reg.acquireStream("t") || !reg.acquireStream("t") {
+	if reg.acquireStream("t", "a") != nil || reg.acquireStream("t", "b") != nil {
 		t.Fatal("streams under the cap refused")
 	}
-	if reg.acquireStream("t") {
+	if reg.acquireStream("t", "c") != errTenantFull {
 		t.Fatal("stream over the cap accepted")
 	}
 	if n := reg.snapshot()["t"].Refused; n != 1 {
 		t.Fatalf("refused = %d, want 1", n)
 	}
-	reg.releaseStream("t")
-	if !reg.acquireStream("t") {
+	reg.releaseStream("t", "a")
+	if reg.acquireStream("t", "c") != nil {
 		t.Fatal("released slot not reusable")
+	}
+}
+
+// One address cannot take a tenant's whole cap, nor pin more than its share
+// of memory; the others still get through, and its slots come back.
+func TestStreamCapPerAddress(t *testing.T) {
+	reg := newRegistry(limits{MaxStreams: 10, MaxStreamsPerAddress: 2})
+	for range 2 {
+		if err := reg.acquireStream("t", "198.51.100.7"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reg.acquireStream("other", "198.51.100.7"); err != errAddressFull {
+		t.Fatalf("third stream of one address, through another tenant: %v", err)
+	}
+	if err := reg.acquireStream("t", "203.0.113.9"); err != nil {
+		t.Fatalf("another address refused: %v", err)
+	}
+	if n := reg.snapshot()["other"].RefusedPerAddress; n != 1 {
+		t.Fatalf("refusedPerAddress = %d, want 1", n)
+	}
+	reg.releaseStream("t", "198.51.100.7")
+	if err := reg.acquireStream("t", "198.51.100.7"); err != nil {
+		t.Fatalf("released slot of the address: %v", err)
+	}
+	reg.releaseStream("t", "198.51.100.7")
+	reg.releaseStream("t", "198.51.100.7")
+	reg.releaseStream("t", "203.0.113.9")
+	if len(reg.addresses) != 0 {
+		t.Fatalf("addresses left behind: %v", reg.addresses)
 	}
 }
 
 func TestHealthEndpoint(t *testing.T) {
 	reg := newRegistry(limits{})
-	reg.acquireStream("t1")
+	reg.acquireStream("t1", "a")
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")
 		json.NewEncoder(w).Encode(struct {
@@ -713,7 +743,7 @@ func TestRefusalIsATLSAlert(t *testing.T) {
 
 	startFakePrivateGateway(t, controlLn.Addr().String(), clientCert, testCert(t, "tenant1.gw.test"), make(chan string, 1))
 	waitForTunnel(t, reg, "tenant1")
-	reg.acquireStream("tenant1")
+	reg.acquireStream("tenant1", "a")
 	if got := alertOf(handshake("tenant1.gw.test")); got != alertTunnelBusy {
 		t.Fatalf("tunnel at its cap: alert %d, want %d", got, alertTunnelBusy)
 	}

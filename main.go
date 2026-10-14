@@ -49,8 +49,9 @@ func main() {
 	}
 
 	reg := newRegistry(limits{
-		MaxStreams:  envInt("TENANT_MAX_STREAMS", 1024),
-		MaxBytesSec: envInt("TENANT_MAX_MBPS", 0) * 1_000_000 / 8,
+		MaxStreams:           envInt("TENANT_MAX_STREAMS", 1024),
+		MaxStreamsPerAddress: envInt("MAX_STREAMS_PER_ADDRESS", 128),
+		MaxBytesSec:          envInt("TENANT_MAX_MBPS", 0) * 1_000_000 / 8,
 	})
 	tenants.reloadOnSIGHUP(reg, log.Printf)
 	// 10 auth failures per minute per IP before drops kick in

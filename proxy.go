@@ -45,8 +45,6 @@ func (t turnRelay) serve(conn net.Conn, peeked []byte) {
 		return
 	}
 	defer relay.Close()
-	boundSendQueue(conn)
-	boundSendQueue(relay)
 	if _, err := relay.Write(peeked); err != nil {
 		return
 	}
@@ -91,6 +89,10 @@ func refuseTLS(conn net.Conn, alert byte) {
 
 func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tenantStore, turn turnRelay) {
 	defer conn.Close()
+	// a client that stops reading would otherwise have the kernel hold
+	// megabytes for it (TCP autotuning); media relayed over TLS wants its
+	// sending queue short as well
+	boundSendQueue(conn)
 	select {
 	case pendingHellos <- struct{}{}:
 	default:
@@ -117,12 +119,18 @@ func handleClient(conn net.Conn, baseDomain string, reg *registry, tenants *tena
 		}
 		return
 	}
-	if !reg.acquireStream(tenant) {
+	address := ipKeyOf(conn.RemoteAddr())
+	switch err := reg.acquireStream(tenant, address); err {
+	case errTenantFull:
 		refuseTLS(conn, alertTunnelBusy)
 		log.Printf("proxy: stream cap reached for %q, dropping %s", tenant, logAddr(conn.RemoteAddr()))
 		return
+	case errAddressFull:
+		refuseTLS(conn, alertTunnelBusy)
+		log.Printf("proxy: address cap reached for %q, dropping %s", tenant, logAddr(conn.RemoteAddr()))
+		return
 	}
-	defer reg.releaseStream(tenant)
+	defer reg.releaseStream(tenant, address)
 	stream, err := sess.Open()
 	if err != nil {
 		refuseTLS(conn, alertTunnelBusy)

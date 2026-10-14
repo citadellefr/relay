@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"sync"
 	"time"
 
@@ -10,33 +11,41 @@ import (
 
 // limits are global defaults applied to every tenant. Zero means unlimited.
 type limits struct {
-	MaxStreams  int // concurrent proxied connections per tenant
-	MaxBytesSec int // shared bandwidth budget per tenant, bytes/second
+	MaxStreams int // concurrent proxied connections per tenant
+	// concurrent proxied connections per client address (ipKeyOf), all tenants
+	// together: one address cannot take a tenant's whole cap, and what it can
+	// pin in memory is bounded — a stream whose client stops reading holds up
+	// to a yamux window here
+	MaxStreamsPerAddress int
+	MaxBytesSec          int // shared bandwidth budget per tenant, bytes/second
 }
 
 // tenantState survives disconnections so counters tell the whole story.
 type tenantState struct {
-	sess          *yamux.Session
-	connectedAt   time.Time
-	connects      uint64
-	activeStreams int
-	totalStreams  uint64
-	key           string        // key id the live session authenticated with
-	bandwidth     *rate.Limiter // nil when unlimited
-	refused       uint64        // connections turned away at the stream cap
-	rtt           time.Duration // last ping of the live session, 0 = not yet
-	lastDrop      string        // why the previous session ended
+	sess              *yamux.Session
+	connectedAt       time.Time
+	connects          uint64
+	activeStreams     int
+	totalStreams      uint64
+	key               string        // key id the live session authenticated with
+	bandwidth         *rate.Limiter // nil when unlimited
+	refused           uint64        // connections turned away at the stream cap
+	refusedPerAddress uint64        // turned away at the cap of their address
+	rtt               time.Duration // last ping of the live session, 0 = not yet
+	lastDrop          string        // why the previous session ended
 }
 
 // registry maps a tenant id to its live tunnel session and usage counters.
 type registry struct {
 	mu      sync.Mutex
 	tenants map[string]*tenantState
-	lim     limits
+	// open streams by client address
+	addresses map[string]int
+	lim       limits
 }
 
 func newRegistry(lim limits) *registry {
-	return &registry{tenants: make(map[string]*tenantState), lim: lim}
+	return &registry{tenants: make(map[string]*tenantState), addresses: make(map[string]int), lim: lim}
 }
 
 func (r *registry) state(tenant string) *tenantState {
@@ -101,24 +110,39 @@ func (r *registry) lookup(tenant string) *yamux.Session {
 	return nil
 }
 
-// acquireStream reserves a stream slot; false when the tenant is at its cap.
-func (r *registry) acquireStream(tenant string) bool {
+var (
+	errTenantFull  = errors.New("tenant at its stream cap")
+	errAddressFull = errors.New("address at its stream cap")
+)
+
+// acquireStream reserves a stream slot for a client of tenant at address.
+func (r *registry) acquireStream(tenant, address string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	st := r.state(tenant)
 	if r.lim.MaxStreams > 0 && st.activeStreams >= r.lim.MaxStreams {
 		st.refused++
-		return false
+		return errTenantFull
+	}
+	if r.lim.MaxStreamsPerAddress > 0 && r.addresses[address] >= r.lim.MaxStreamsPerAddress {
+		st.refusedPerAddress++
+		return errAddressFull
 	}
 	st.activeStreams++
 	st.totalStreams++
-	return true
+	r.addresses[address]++
+	return nil
 }
 
-func (r *registry) releaseStream(tenant string) {
+func (r *registry) releaseStream(tenant, address string) {
 	r.mu.Lock()
 	if st := r.tenants[tenant]; st != nil && st.activeStreams > 0 {
 		st.activeStreams--
+	}
+	if r.addresses[address] <= 1 {
+		delete(r.addresses, address)
+	} else {
+		r.addresses[address]--
 	}
 	r.mu.Unlock()
 }
@@ -155,14 +179,15 @@ func (r *registry) closeRevoked(keys map[string]string) int {
 
 // tenantStats is the JSON shape served by the health endpoint.
 type tenantStats struct {
-	Connected     bool      `json:"connected"`
-	ConnectedAt   time.Time `json:"connectedAt,omitzero"`
-	Connects      uint64    `json:"connects"`
-	ActiveStreams int       `json:"activeStreams"`
-	TotalStreams  uint64    `json:"totalStreams"`
-	Refused       uint64    `json:"refused"`
-	RTTMs         int64     `json:"rttMs,omitempty"`
-	LastDrop      string    `json:"lastDrop,omitempty"`
+	Connected         bool      `json:"connected"`
+	ConnectedAt       time.Time `json:"connectedAt,omitzero"`
+	Connects          uint64    `json:"connects"`
+	ActiveStreams     int       `json:"activeStreams"`
+	TotalStreams      uint64    `json:"totalStreams"`
+	Refused           uint64    `json:"refused"`
+	RefusedPerAddress uint64    `json:"refusedPerAddress"`
+	RTTMs             int64     `json:"rttMs,omitempty"`
+	LastDrop          string    `json:"lastDrop,omitempty"`
 }
 
 func (r *registry) snapshot() map[string]tenantStats {
@@ -171,12 +196,13 @@ func (r *registry) snapshot() map[string]tenantStats {
 	out := make(map[string]tenantStats, len(r.tenants))
 	for id, st := range r.tenants {
 		s := tenantStats{
-			Connected:     st.sess != nil,
-			Connects:      st.connects,
-			ActiveStreams: st.activeStreams,
-			TotalStreams:  st.totalStreams,
-			Refused:       st.refused,
-			LastDrop:      st.lastDrop,
+			Connected:         st.sess != nil,
+			Connects:          st.connects,
+			ActiveStreams:     st.activeStreams,
+			TotalStreams:      st.totalStreams,
+			Refused:           st.refused,
+			RefusedPerAddress: st.refusedPerAddress,
+			LastDrop:          st.lastDrop,
 		}
 		if st.sess != nil {
 			s.ConnectedAt = st.connectedAt

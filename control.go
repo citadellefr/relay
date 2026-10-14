@@ -213,10 +213,11 @@ func yamuxConfig() *yamux.Config {
 	cfg.EnableKeepAlive = false
 	cfg.StreamOpenTimeout = 0
 	cfg.ConnectionWriteTimeout = writeTimeout
-	// the receiver's window bounds the sender: 256 KiB held downloads to about
-	// 5 MB/s at 50 ms. Worst case in memory is streams × window per tenant,
-	// which TENANT_MAX_STREAMS bounds.
-	cfg.MaxStreamWindowSize = 2 * 1024 * 1024
+	// the receiver's window bounds the sender, a download being worth one
+	// window per round trip: 1 MiB is 100 Mbit/s at 40 ms, 400 at 10 ms. And it
+	// is what a stream whose client stopped reading pins here, which
+	// MaxStreamsPerAddress multiplies (robustesse/ag1.md, I5).
+	cfg.MaxStreamWindowSize = 1024 * 1024
 	return cfg
 }
 
