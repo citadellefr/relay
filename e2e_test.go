@@ -250,27 +250,32 @@ func TestKeyID(t *testing.T) {
 	}
 }
 
-// What deploy/pki.sh hands out has to be what control.go accepts, by the road
-// a server takes: the key typed from the customer sheet gives the private key,
-// the certificate was signed for it in advance, and the id printed next to it
-// is what tenants.json holds.
+// What `citadelle-poste pki` hands out has to be what control.go accepts, by
+// the road a server takes: the key typed from the customer sheet gives the
+// private key, the certificate was signed for it in advance, and the id printed
+// next to it is what tenants.json holds. The binary comes from
+// CITADELLE_POSTE, or the PATH (nix build ../deploy#citadelle-poste).
 func TestPKICertificateAccepted(t *testing.T) {
-	if _, err := exec.LookPath("openssl"); err != nil {
-		t.Skip("openssl not installed")
+	poste := os.Getenv("CITADELLE_POSTE")
+	if poste == "" {
+		poste, _ = exec.LookPath("citadelle-poste")
+	}
+	if poste == "" {
+		t.Skip("citadelle-poste not available")
 	}
 	dir := t.TempDir()
 	pki := func(args ...string) string {
 		t.Helper()
-		cmd := exec.Command("./deploy/pki.sh", args...)
+		cmd := exec.Command(poste, append([]string{"pki"}, args...)...)
 		cmd.Env = append(os.Environ(), "PKI_DIR="+dir)
 		out, err := cmd.CombinedOutput()
 		if err != nil {
-			t.Fatalf("pki.sh %v: %v\n%s", args, err, out)
+			t.Fatalf("citadelle-poste pki %v: %v\n%s", args, err, out)
 		}
 		return string(out)
 	}
-	pki("init")
-	sheet := pki("issue", "tenant1")
+	pki("ca")
+	sheet := pki("locataire", "tenant1")
 
 	typed := regexp.MustCompile(`(?m)^\s+((?:[A-Z2-7]{4} ){12}[A-Z2-7]{4})$`).FindStringSubmatch(sheet)
 	if typed == nil {
@@ -297,8 +302,8 @@ func TestPKICertificateAccepted(t *testing.T) {
 	if !strings.Contains(sheet, keyID(leaf)) {
 		t.Fatalf("the sheet does not print the key id %s:\n%s", keyID(leaf), sheet)
 	}
-	if entries, _ := os.ReadDir(dir); len(entries) != 4 {
-		t.Fatalf("want ca.crt, ca.key, ca.srl and tenant1.crt only, got %v", entries)
+	if entries, _ := os.ReadDir(dir); len(entries) != 3 {
+		t.Fatalf("want ca.crt, ca.key and tenant1.crt only, got %v", entries)
 	}
 
 	pool, err := loadCertPool(filepath.Join(dir, "ca.crt"))
@@ -322,7 +327,7 @@ func TestPKICertificateAccepted(t *testing.T) {
 	clientCert := tls.Certificate{Certificate: [][]byte{block.Bytes}, PrivateKey: key}
 	line, err := controlAuth(t, controlLn, `{"v":1}`, clientCert)
 	if err != nil {
-		t.Fatalf("the control plane refused a certificate issued by pki.sh: %v", err)
+		t.Fatalf("the control plane refused a certificate issued by citadelle-poste pki: %v", err)
 	}
 	if !strings.Contains(line, `"ok":true`) {
 		t.Fatalf("auth refused: %q", line)
