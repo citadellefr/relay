@@ -59,7 +59,7 @@ Configuration is provided through environment variables:
 
 ### `tenants.json`
 
-Binds each tenant identifier to the id of its key, `hex(SHA-256(Ed25519 public key))`, as printed by `deploy/pki.sh`. It holds no secret:
+Binds each tenant identifier to the id of its key, `hex(SHA-256(Ed25519 public key))`, as printed by `citadelle-poste pki locataire`. It holds no secret:
 
 ```json
 {
@@ -75,19 +75,19 @@ A certificate signed by the CA is not enough to get in: its key must be the one 
 
 ## Control Plane PKI (mTLS)
 
-A companion script [deploy/pki.sh](file:///home/me/Code/Citadelle/relay/deploy/pki.sh) is provided to generate and manage control-plane certificates:
+The control-plane certificates come from `citadelle-poste pki` (the `deploy` repository, the same PKI as the gateway):
 
 ```bash
 # Initialize CA on the admin machine
-./deploy/pki.sh init
+citadelle-poste pki ca
 
 # Draw a tenant's key (a 32-byte seed, printed once and stored nowhere),
 # sign the certificate of the Ed25519 pair it gives (CN=tenant1), and print
 # the key id that goes into tenants.json
-./deploy/pki.sh issue tenant1
+citadelle-poste pki locataire tenant1
 
 # Inspect an issued certificate
-./deploy/pki.sh show tenant1
+citadelle-poste pki voir tenant1
 ```
 
 ---
@@ -133,5 +133,4 @@ Run unit and integration tests:
 
 ```bash
 go test -v ./...
-bash deploy/pki_test.sh
 ```

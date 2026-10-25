@@ -43,7 +43,7 @@ func testCert(t *testing.T, hosts ...string) tls.Certificate {
 }
 
 // testClientCert issues a self-signed Ed25519 client certificate whose CN is
-// the tenant id: the shape deploy/pki.sh signs for a seed.
+// the tenant id: the shape citadelle-poste pki signs for a seed.
 func testClientCert(t *testing.T, tenant string) tls.Certificate {
 	t.Helper()
 	pub, key, err := ed25519.GenerateKey(rand.Reader)
